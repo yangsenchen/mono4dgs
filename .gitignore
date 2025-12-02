@@ -1,0 +1,83 @@
+# ==========================
+# 用户自定义屏蔽 (Custom)
+# ==========================
+__cache_files/
+
+# 如果之前的代码生成的 output 也想屏蔽，可以把下面这行解开注释
+# results/
+# *.npz
+# *.mp4
+
+# ==========================
+# Python 编译与缓存
+# ==========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==========================
+# 虚拟环境 (Virtual Environments)
+# ==========================
+# 常见的虚拟环境文件夹命名
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================
+# VS Code (IDE Settings)
+# ==========================
+.vscode/
+*.code-workspace
+
+# ==========================
+# 包管理与构建 (Distribution / Build)
+# ==========================
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==========================
+# 测试与代码质量 (Testing / Linting)
+# ==========================
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+htmlcov/
+
+# ==========================
+# Jupyter Notebooks
+# ==========================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# ==========================
+# 操作系统生成文件 (OS Generated)
+# ==========================
+.DS_Store
+.DS_Store?
+._*
+.Trashes
+ehthumbs.db
+Thumbs.db
