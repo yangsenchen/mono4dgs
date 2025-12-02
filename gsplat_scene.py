@@ -43,8 +43,14 @@ class GSSolver:
         self.device = torch.device("cuda:0")
         self.output_dir = output_dir
         
-        # 创建输出目录
-        os.makedirs(self.output_dir, exist_ok=True)
+        # [NEW] 创建分类子文件夹
+        self.dir_params = os.path.join(self.output_dir, "params")
+        self.dir_images = os.path.join(self.output_dir, "images")
+        self.dir_depths = os.path.join(self.output_dir, "depths")
+        os.makedirs(self.dir_params, exist_ok=True)
+        os.makedirs(self.dir_images, exist_ok=True)
+        os.makedirs(self.dir_depths, exist_ok=True)
+        
         print(f"Output Directory set to: {self.output_dir}")
 
         print(f"Loading data from {data_path}...")
@@ -79,7 +85,7 @@ class GSSolver:
             self.K = torch.tensor([[self.focal, 0, self.W / 2.0], [0, self.focal, self.H / 2.0], [0, 0, 1]], device=self.device)
             print(f"Warning: Using guessed focal length {self.focal:.2f}")
 
-        # [NEW] 从 SAM2 视频加载 Mask
+        # 从 SAM2 视频加载 Mask
         self.gt_masks, self.core_masks = self._load_masks_from_video(sam2_video_path)
         
         if self.gt_masks is None:
@@ -94,7 +100,6 @@ class GSSolver:
         self._init_spheres()
 
     def _load_masks_from_video(self, video_path):
-        """从 SAM2 视频加载 Mask (White=Object, Black=Background)"""
         print(f"Loading masks from video: {video_path}")
         if not os.path.exists(video_path):
             print(f"Error: Video file not found: {video_path}")
@@ -115,10 +120,7 @@ class GSSolver:
             if (gray.shape[1] != self.W) or (gray.shape[0] != self.H):
                 gray = cv2.resize(gray, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
             
-            # 白色(>127)是物体
             mask_np = (gray > 127).astype(np.uint8)
-            
-            # 核心区
             core_np = cv2.erode(mask_np, kernel, iterations=1)
             
             full_masks.append(torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(-1))
@@ -127,7 +129,6 @@ class GSSolver:
             
         cap.release()
         
-        # 补帧逻辑
         if len(full_masks) < self.num_frames:
             print(f"Warning: Video frames ({len(full_masks)}) < NPZ frames ({self.num_frames}). Padding.")
             last_full = full_masks[-1]
@@ -144,7 +145,7 @@ class GSSolver:
         return tensor
 
     def _init_spheres(self):
-        print("Initializing Gaussian Ellipsoids (Anisotropic)...") # [Updated]
+        print("Initializing Gaussian Ellipsoids (Anisotropic)...")
         idx = 0
         depth = self.depths[idx]
         mask = self.gt_masks[idx, ..., 0] > 0.5
@@ -163,10 +164,7 @@ class GSSolver:
         self.means = (c2w[:3, :3] @ xyz_cam.T).T + c2w[:3, 3]
         
         N = self.means.shape[0]
-        
-        # [Modified] 允许椭球体：将半径维度从 (N, 1) 改为 (N, 3)
         self.radii = torch.ones((N, 3), device=self.device) * -5.0 
-        
         self.quats = torch.rand((N, 4), device=self.device); self.quats[:, 0] = 1.0
         
         rgb_vals = self.images[idx][valid]
@@ -218,6 +216,18 @@ class GSSolver:
             self.denom = torch.zeros(self.means.shape[0], device=self.device)
             return to_clone.sum() > 0
 
+    # [NEW] 保存高斯点参数的功能
+    def save_params(self, frame_idx):
+        save_path = os.path.join(self.dir_params, f"gaussians_{frame_idx:03d}.pt")
+        torch.save({
+            'means': self.means.detach().cpu(),
+            'quats': self.quats.detach().cpu(),
+            'radii': self.radii.detach().cpu(),
+            'rgbs': self.rgbs.detach().cpu(),
+            'opacities': self.opacities.detach().cpu(),
+            'num_points': self.means.shape[0]
+        }, save_path)
+
     def train_frame(self, frame_idx, iterations):
         allow_densify = True if frame_idx == 0 else (frame_idx % 5 == 0)
 
@@ -241,27 +251,29 @@ class GSSolver:
         viewmat = torch.inverse(self.c2ws[frame_idx])
         bg_color = torch.tensor([1.0, 1.0, 1.0], device=self.device)
 
+        # Depth Loss 权重
+        lambda_depth = 0.2
+
         pbar = tqdm(range(iterations), desc=f"Frame {frame_idx}", leave=False)
         
+        render_d_final = None # 用于最后返回
+
         for i in pbar:
-            # [Modified] 不再 expand 为各向同性，直接使用 3 维度的 radii
             scales = self.radii 
-            
             colors_precomp = torch.cat([torch.sigmoid(self.rgbs), torch.ones_like(self.rgbs[:, :1])], dim=1)
 
+            # --- 1. RGB Rendering ---
             meta = rasterization(
                 self.means, F.normalize(self.quats, dim=-1), 
-                torch.exp(scales), # [Modified] 传入各向异性的 scale
+                torch.exp(scales), 
                 torch.sigmoid(self.opacities), 
                 colors_precomp, 
                 viewmat[None], self.K[None], self.W, self.H, 
                 packed=False
             )
             render_rgba = self._align_shape(meta[0][0])
-            
             render_rgb_fg = render_rgba[..., :3]
             render_alpha = render_rgba[..., 3:4]
-            
             render_rgb = render_rgb_fg + bg_color * (1.0 - render_alpha)
 
             # Losses
@@ -275,20 +287,31 @@ class GSSolver:
             if bg_mask.sum() > 0:
                 loss += 5.0 * l1_loss(render_alpha * bg_mask, torch.zeros_like(bg_mask))
             
+            # --- 2. Depth Rendering & Loss ---
+            # 只有当 Mask 存在内容时才计算深度 Loss
             if gt_mask.sum() > 0:
+                # 将高斯中心变换到相机坐标系
                 means_cam = self.means @ viewmat[:3, :3].T + viewmat[:3, 3]
+                # 提取 Z 轴作为 "颜色" 传入光栅化器
                 d_cols = means_cam[:, 2:3].expand(-1, 3)
                 
-                # [Modified] 深度图渲染也同步使用各向异性 scale
                 meta_d = rasterization(
-                    self.means.detach(), F.normalize(self.quats.detach(), dim=-1), 
-                    torch.exp(scales.detach()), 
-                    torch.sigmoid(self.opacities.detach()), d_cols,
+                    self.means, F.normalize(self.quats, dim=-1), 
+                    torch.exp(scales), 
+                    torch.sigmoid(self.opacities), 
+                    d_cols, # 这里传入的是深度值
                     viewmat[None], self.K[None], self.W, self.H, packed=False
                 )
                 render_d = self._align_shape(meta_d[0][0][..., 0:1])
-                loss += 0.2 * l1_loss(render_d * gt_mask, gt_d * gt_mask)
+                
+                # [Updated] Depth Loss - 使用 GT Mask 过滤
+                loss += lambda_depth * l1_loss(render_d * gt_mask, gt_d * gt_mask)
+                
+                # 记录最后一次迭代的深度图用于可视化
+                if i == iterations - 1:
+                    render_d_final = render_d.detach()
 
+            # --- 3. Rigidity Loss ---
             if frame_idx > 0 and self.knn_rigid_indices is not None:
                 n_prev = self.means_prev_all.shape[0]
                 curr_rigid = self.means[:n_prev]
@@ -316,10 +339,23 @@ class GSSolver:
                         {'params': [self.opacities], 'lr': 0.05}
                     ], lr=0.001)
 
-        return (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
+        # 准备返回数据
+        rgb_np = (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
+        
+        depth_np = None
+        if render_d_final is not None:
+            # 简单的深度可视化: 假设深度范围在 0-5m 之间 (可根据数据调整)
+            d_vis = render_d_final.cpu().numpy()
+            d_vis = (d_vis / 5.0 * 255).clip(0, 255).astype(np.uint8)
+            depth_np = np.repeat(d_vis, 3, axis=-1)
+        else:
+            depth_np = np.zeros_like(rgb_np)
+
+        return rgb_np, depth_np
 
     def run(self):
         frames = []
+        depth_frames = []
         
         print(f"=== Starting Ellipsoidal Reconstruction ===")
         print(f"=== Saving to: {self.output_dir} ===")
@@ -337,17 +373,32 @@ class GSSolver:
                         velocity = self.means_prev_all[:min_n] - self.means_prev_2[:min_n]
                         self.means.data[:min_n] += velocity
 
-            rgb_np = self.train_frame(t, iters)
-            frames.append(Image.fromarray(rgb_np))
+            # [Modified] 接收 RGB 和 Depth
+            rgb_np, depth_np = self.train_frame(t, iters)
+            
+            # [NEW] 保存高斯参数
+            self.save_params(t)
+            
+            # 保存图像
+            img_pil = Image.fromarray(rgb_np)
+            depth_pil = Image.fromarray(depth_np)
+            
+            frames.append(img_pil)
+            depth_frames.append(depth_pil)
             
             self.means_prev_all = self.means.detach().clone()
             if t > 0: self.means_prev_2 = self.means_prev_all.clone()
             else: self.means_prev_2 = self.means.detach().clone()
 
-            frames[-1].save(f"{self.output_dir}/frame_{t:03d}.png")
+            # 保存单帧图片
+            img_pil.save(f"{self.dir_images}/frame_{t:03d}.png")
+            depth_pil.save(f"{self.dir_depths}/depth_{t:03d}.png")
             
-        frames[0].save(f"{self.output_dir}/result.gif", save_all=True, append_images=frames[1:], duration=40, loop=0)
-        print(f"Done! Saved to {self.output_dir}/result.gif")
+        # 保存 GIF
+        frames[0].save(f"{self.output_dir}/result_rgb.gif", save_all=True, append_images=frames[1:], duration=40, loop=0)
+        depth_frames[0].save(f"{self.output_dir}/result_depth.gif", save_all=True, append_images=depth_frames[1:], duration=40, loop=0)
+        
+        print(f"Done! Results saved to {self.output_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gaussian Splatting Solver")
@@ -360,14 +411,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # 生成时间戳: 月日时分秒 (例如: 1125_143005)
     current_time = datetime.datetime.now().strftime("%m%d_%H%M%S")
-    
-    # 拼接最终的文件夹名称: results/MMDD_HHMMSS_ExpName
     folder_name = f"{current_time}_{args.exp_name}"
     full_output_dir = os.path.join(args.output_root, folder_name)
 
-    # 运行 Solver
     solver = GSSolver(
         data_path=args.data_path, 
         sam2_video_path=args.video_path, 
