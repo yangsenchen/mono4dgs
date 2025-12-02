@@ -63,7 +63,6 @@ class GSSolver:
         self.c2ws = torch.from_numpy(data[pose_key].astype(np.float32)).to(self.device)
         
         # [Critical] 坐标系翻转: OpenCV -> OpenGL
-        print("Applying OpenCV -> OpenGL coordinate conversion...")
         self.c2ws[..., 0:3, 1:3] *= -1
         
         self.num_frames, self.H, self.W, _ = self.images.shape
@@ -116,7 +115,7 @@ class GSSolver:
             if (gray.shape[1] != self.W) or (gray.shape[0] != self.H):
                 gray = cv2.resize(gray, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
             
-            # [修正逻辑] 白色(>127)是物体
+            # 白色(>127)是物体
             mask_np = (gray > 127).astype(np.uint8)
             
             # 核心区
@@ -145,7 +144,7 @@ class GSSolver:
         return tensor
 
     def _init_spheres(self):
-        print("Initializing Gaussian Spheres...")
+        print("Initializing Gaussian Ellipsoids (Anisotropic)...") # [Updated]
         idx = 0
         depth = self.depths[idx]
         mask = self.gt_masks[idx, ..., 0] > 0.5
@@ -165,7 +164,9 @@ class GSSolver:
         
         N = self.means.shape[0]
         
-        self.radii = torch.ones((N, 1), device=self.device) * -5.0 
+        # [Modified] 允许椭球体：将半径维度从 (N, 1) 改为 (N, 3)
+        self.radii = torch.ones((N, 3), device=self.device) * -5.0 
+        
         self.quats = torch.rand((N, 4), device=self.device); self.quats[:, 0] = 1.0
         
         rgb_vals = self.images[idx][valid]
@@ -180,7 +181,7 @@ class GSSolver:
         
         self.grad_accum = torch.zeros(N, device=self.device)
         self.denom = torch.zeros(N, device=self.device)
-        print(f"[*] Initialized {N} spheres.")
+        print(f"[*] Initialized {N} Gaussians (Ellipsoids).")
 
     def _compute_knn(self, points, k=20):
         indices = []
@@ -243,11 +244,14 @@ class GSSolver:
         pbar = tqdm(range(iterations), desc=f"Frame {frame_idx}", leave=False)
         
         for i in pbar:
-            scales_isotropic = self.radii.expand(-1, 3)
+            # [Modified] 不再 expand 为各向同性，直接使用 3 维度的 radii
+            scales = self.radii 
+            
             colors_precomp = torch.cat([torch.sigmoid(self.rgbs), torch.ones_like(self.rgbs[:, :1])], dim=1)
 
             meta = rasterization(
-                self.means, F.normalize(self.quats, dim=-1), torch.exp(scales_isotropic), 
+                self.means, F.normalize(self.quats, dim=-1), 
+                torch.exp(scales), # [Modified] 传入各向异性的 scale
                 torch.sigmoid(self.opacities), 
                 colors_precomp, 
                 viewmat[None], self.K[None], self.W, self.H, 
@@ -274,8 +278,11 @@ class GSSolver:
             if gt_mask.sum() > 0:
                 means_cam = self.means @ viewmat[:3, :3].T + viewmat[:3, 3]
                 d_cols = means_cam[:, 2:3].expand(-1, 3)
+                
+                # [Modified] 深度图渲染也同步使用各向异性 scale
                 meta_d = rasterization(
-                    self.means.detach(), F.normalize(self.quats.detach(), dim=-1), torch.exp(scales_isotropic.detach()), 
+                    self.means.detach(), F.normalize(self.quats.detach(), dim=-1), 
+                    torch.exp(scales.detach()), 
                     torch.sigmoid(self.opacities.detach()), d_cols,
                     viewmat[None], self.K[None], self.W, self.H, packed=False
                 )
@@ -312,10 +319,9 @@ class GSSolver:
         return (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
 
     def run(self):
-        # 注意：这里不再硬编码 out_dir，直接使用 self.output_dir
         frames = []
         
-        print(f"=== Starting Spherical Car Reconstruction ===")
+        print(f"=== Starting Ellipsoidal Reconstruction ===")
         print(f"=== Saving to: {self.output_dir} ===")
         
         for t in range(self.num_frames):
@@ -345,7 +351,6 @@ class GSSolver:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gaussian Splatting Solver")
-    
     
     parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/learn-genmojo/data/car-turn/MegaSAM_Outputs/car-turn_sgd_cvd_hr.npz", help="Path to the npz data file")
     parser.add_argument("--video_path", type=str, default="sam2.mp4", help="Path to the SAM2 video mask file")
