@@ -11,10 +11,8 @@ from torch import optim
 from tqdm import tqdm
 import cv2 
 from gsplat import rasterization
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torchvision.utils import save_image # 用于保存Debug图片
+import trimesh
 import torchvision.transforms as T
 from diffusers import (
     DDPMScheduler, 
@@ -24,199 +22,138 @@ from diffusers import (
 from transformers import CLIPVisionModelWithProjection
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
-import os
 
-# --- 修复 1: 输入维度改为 772 (768图像特征 + 4姿态) ---
-class CLIPCameraProjection(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.proj = nn.Linear(772, 768) 
-        self.norm = nn.Identity()
+# ==========================================
+# 1. 辅助工具函数
+# ==========================================
 
-    def forward(self, x):
-        return self.proj(x)
+def crop_image_by_mask(image_tensor, mask_tensor, target_size=256, padding=0.1):
+    """
+    [核心修复] 非微分裁剪，仅用于处理参考图 Condition。
+    确保 Zero123 看到的物体是居中且放大的。
+    image_tensor: [C, H, W]
+    mask_tensor: [1, H, W]
+    """
+    # 找 BBox
+    nonzero = torch.nonzero(mask_tensor[0] > 0.5)
+    if nonzero.shape[0] == 0:
+        # 如果 Mask 为空，直接缩放原图（兜底）
+        return F.interpolate(image_tensor.unsqueeze(0), (target_size, target_size), mode='bilinear').squeeze(0)
+    
+    y_min, x_min = torch.min(nonzero, dim=0)[0]
+    y_max, x_max = torch.max(nonzero, dim=0)[0]
+    
+    center_y = (y_min + y_max) / 2.0
+    center_x = (x_min + x_max) / 2.0
+    height = y_max - y_min
+    width = x_max - x_min
+    
+    # 变成正方形
+    side_length = max(height, width) * (1 + padding)
+    
+    # 计算裁剪坐标
+    top = int(max(0, center_y - side_length / 2))
+    left = int(max(0, center_x - side_length / 2))
+    bottom = int(min(image_tensor.shape[1], center_y + side_length / 2))
+    right = int(min(image_tensor.shape[2], center_x + side_length / 2))
+    
+    # Crop
+    crop = image_tensor[:, top:bottom, left:right]
+    
+    # Resize 到 256x256
+    crop_resized = F.interpolate(crop.unsqueeze(0), (target_size, target_size), mode='bilinear', align_corners=False).squeeze(0)
+    
+    return crop_resized
 
-class Zero123Guide(nn.Module):
-    def __init__(self, device, model_key="ashawkey/zero123-xl-diffusers"):
-        super().__init__()
-        self.device = device
-        self.dtype = torch.float16
-        
-        print(f"[SDS] Initializing Zero123 Guidance...")
-        print(f"[SDS] Loading components from: {model_key}...")
+def crop_and_resize_differentiable(img_tensor, mask_tensor, target_size=256, padding=0.1):
+    """
+    [保留] 微分裁剪，用于 SDS 过程中对渲染出的预测图进行裁剪
+    img_tensor: [1, 3, H, W]
+    mask_tensor: [1, 1, H, W]
+    """
+    nonzero = torch.nonzero(mask_tensor[0, 0] > 0.5)
+    if nonzero.shape[0] == 0:
+        return F.interpolate(img_tensor, (target_size, target_size), mode='bilinear')
 
-        try:
-            # 1. Load VAE
-            self.vae = AutoencoderKL.from_pretrained(
-                model_key, subfolder="vae", torch_dtype=self.dtype
-            ).to(device)
-            
-            # 2. Load UNet
-            self.unet = UNet2DConditionModel.from_pretrained(
-                model_key, subfolder="unet", torch_dtype=self.dtype
-            ).to(device)
-            
-            # 3. Load Image Encoder
-            self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-                model_key, subfolder="image_encoder", torch_dtype=self.dtype
-            ).to(device)
-            
-            # 4. Load Scheduler
-            self.scheduler = DDPMScheduler.from_pretrained(
-                model_key, subfolder="scheduler"
-            )
-            
-            # 5. Load Camera Projection
-            self.cc_projection = CLIPCameraProjection().to(device, dtype=self.dtype)
-            
-            print("[SDS] Downloading camera projection weights (safetensors)...")
-            
-            cc_path = hf_hub_download(
-                repo_id=model_key, 
-                filename="diffusion_pytorch_model.safetensors", 
-                subfolder="clip_camera_projection"
-            )
-            
-            state_dict = load_file(cc_path)
-            
-            # 映射权重 Key
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if "proj" in k or "linear" in k:
-                    new_state_dict["proj.weight"] = v if "weight" in k else new_state_dict.get("proj.weight")
-                    new_state_dict["proj.bias"] = v if "bias" in k else new_state_dict.get("proj.bias")
-                else:
-                    new_state_dict[k] = v
-            
-            if new_state_dict.get("proj.weight") is not None:
-                self.cc_projection.load_state_dict(new_state_dict, strict=True) # 这里现在可以开启 strict=True
-                print("[SDS] Camera projection loaded successfully.")
-            else:
-                raise RuntimeError("Weight mismatch in camera projection.")
+    y_min, x_min = torch.min(nonzero, dim=0)[0]
+    y_max, x_max = torch.max(nonzero, dim=0)[0]
+    
+    center_y = (y_min + y_max) / 2.0
+    center_x = (x_min + x_max) / 2.0
+    height = y_max - y_min
+    width = x_max - x_min
+    side_length = max(height, width) * (1 + padding) 
+    
+    H, W = img_tensor.shape[2], img_tensor.shape[3]
+    s_x = side_length / W
+    s_y = side_length / H
+    t_x = -1 + 2 * center_x / W
+    t_y = -1 + 2 * center_y / H
+    
+    theta = torch.tensor([[
+        [s_x, 0,   t_x],
+        [0,   s_y, t_y]
+    ]], device=img_tensor.device, dtype=img_tensor.dtype)
+    
+    grid = F.affine_grid(theta, torch.Size([1, 3, target_size, target_size]), align_corners=False)
+    cropped_img = F.grid_sample(img_tensor, grid, align_corners=False)
+    
+    return cropped_img
 
-        except Exception as e:
-            print(f"[Error] Failed to load components: {e}")
-            raise RuntimeError("Could not load Zero123 components.")
-
-        # Cleanup
-        import gc; gc.collect(); torch.cuda.empty_cache()
-
-        self.min_step = 0.02
-        self.max_step = 0.98
-        self.ref_embeddings = None
-        self.c2w_ref = None
-
-    # --- 修复 2: 拼接图像特征和姿态 ---
-    def get_cam_embeddings(self, elevation, azimuth, radius):
-        # 姿态: [B, 4]
-        zero_tensor = torch.zeros_like(radius)
-        camera_pose = torch.stack([elevation, azimuth, radius, zero_tensor], dim=-1).to(self.device, dtype=self.dtype)
-        
-        # 图像特征: [1, 768] -> 扩展到 [B, 768]
-        if self.ref_embeddings is None:
-             raise RuntimeError("Reference embeddings not initialized. Call prepare_condition first.")
-        
-        # 注意: self.ref_embeddings 形状通常是 [1, 768] (来自 image_embeds)
-        # 我们需要将其重复以匹配 camera_pose 的 batch size
-        batch_size = camera_pose.shape[0]
-        ref_emb_expanded = self.ref_embeddings.repeat(batch_size, 1)
-        
-        # 拼接: [B, 768] + [B, 4] -> [B, 772]
-        mlp_input = torch.cat([ref_emb_expanded, camera_pose], dim=-1)
-        
-        return self.cc_projection(mlp_input)
-
-    @torch.no_grad()
-    def prepare_condition(self, ref_image_tensor, c2w_ref):
-        # --- 1. CLIP 分支 (需要 224x224, CLIP 归一化) ---
-        ref_img_224 = F.interpolate(ref_image_tensor, (224, 224), mode='bilinear', align_corners=False)
-        ref_img_norm_clip = T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))(ref_img_224)
-        self.ref_embeddings = self.image_encoder(ref_img_norm_clip).image_embeds.to(dtype=self.dtype)
-
-        # --- 2. VAE 分支 (需要 256x256, [-1, 1] 归一化) ---
-        # 必须把参考图也编码成 latent，用于后续和噪声拼接
-        ref_img_256 = F.interpolate(ref_image_tensor, (256, 256), mode='bilinear', align_corners=False)
-        ref_img_norm_vae = (ref_img_256 - 0.5) * 2
-        ref_img_norm_vae = ref_img_norm_vae.to(dtype=self.dtype)
-        
-        # 编码并存储，注意乘上缩放系数 0.18215
-        self.ref_latents = self.vae.encode(ref_img_norm_vae).latent_dist.mode() * 0.18215
-        
-        self.c2w_ref = c2w_ref
-
-    def compute_relative_pose(self, c2w_curr):
-        T_ref = self.c2w_ref[:3, 3]
-        T_curr = c2w_curr[:3, 3]
-
-        def cartesian_to_spherical(xyz):
-            xy = torch.sqrt(xyz[0]**2 + xyz[2]**2)
-            elevation = torch.atan2(xyz[1], xy)
-            azimuth = torch.atan2(xyz[0], xyz[2])
-            radius = torch.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2)
-            return elevation, azimuth, radius
-
-        el_ref, az_ref, r_ref = cartesian_to_spherical(T_ref)
-        el_curr, az_curr, r_curr = cartesian_to_spherical(T_curr)
-        
-        d_azimuth = torch.rad2deg(az_curr - az_ref)
-        d_elevation = torch.rad2deg(el_curr - el_ref)
-        d_radius = torch.tensor(0.0, device=self.device)
-        
-        d_azimuth = (d_azimuth + 180) % 360 - 180
-        
-        return d_elevation.unsqueeze(0), d_azimuth.unsqueeze(0), d_radius.unsqueeze(0)
-
-    def sds_loss(self, pred_rgb, relative_pose):
-        # 1. 准备渲染图 Latents
-        pred_256 = F.interpolate(pred_rgb, (256, 256), mode='bilinear', align_corners=False)
-        
-        # 将 Float32 的渲染图转为 Float16 (Half) 给 VAE
-        vae_input = (pred_256 - 0.5) * 2
-        vae_input = vae_input.to(dtype=self.dtype) 
-        
-        # VAE 编码 (全程 Half)
-        latents = self.vae.encode(vae_input).latent_dist.sample()
-        latents = latents * 0.18215
-        
-        # 2. 加噪
-        noise = torch.randn_like(latents)
-        t = torch.randint(
-            int(self.min_step * self.scheduler.config.num_train_timesteps), 
-            int(self.max_step * self.scheduler.config.num_train_timesteps), 
-            [1], device=self.device
-        )
-        noisy_latents = self.scheduler.add_noise(latents, noise, t)
-        
-        # 3. 拼接 Latents
-        latent_model_input = torch.cat([noisy_latents, self.ref_latents], dim=1)
-        
-        # 4. 获取相机条件
-        d_el, d_az, d_r = relative_pose
-        camera_embeddings = self.get_cam_embeddings(d_el, d_az, d_r)
-        
-        # 5. UNet 预测 (Half)
-        encoder_hidden_states = self.ref_embeddings.unsqueeze(1)
-        noise_pred = self.unet(
-            latent_model_input, 
-            t, 
-            encoder_hidden_states=encoder_hidden_states,
-            class_labels=camera_embeddings
-        ).sample
-
-        # 6. 计算梯度 (Half)
-        w = 1 - (t / self.scheduler.config.num_train_timesteps)
-        grad = w[:, None, None, None] * (noise_pred - noise)
-        grad = torch.nan_to_num(grad)
-        
-        # [核心修复]: 在这里将 Half 转为 Float32 进行 Loss 计算
-        # 这样 Backward 时，梯度会以 Float32 传到这里，然后安全转回 Half 给 VAE
-        latents_float = latents.float()
-        grad_float = grad.float()
-        
-        target = (latents_float - grad_float).detach()
-        loss = 0.5 * F.mse_loss(latents_float, target, reduction="sum")
-        
-        return loss
+def get_orbit_camera(c2w, angle_x, angle_y, center=None, device='cuda'):
+    if center is None:
+        center = torch.zeros(3, device=device)
+    
+    # 1. Get current position and radius relative to the center
+    pos_curr = c2w[:3, 3]
+    vec = pos_curr - center
+    radius = torch.norm(vec) + 1e-7 # Prevent division by zero
+    
+    x, y, z = vec[0], vec[1], vec[2]
+    
+    # 2. Convert to Spherical Coordinates (Y-up convention)
+    # Clamp input to acos to range [-1, 1] to prevent NaNs
+    cos_theta = torch.clamp(y / radius, -1.0 + 1e-6, 1.0 - 1e-6)
+    theta = torch.acos(cos_theta)       # Inclination (0 to PI)
+    phi = torch.atan2(z, x)             # Azimuth
+    
+    # 3. Apply Angle Deltas
+    # angle_y is elevation change. If angle_y > 0 (move up), theta should decrease.
+    theta_new = theta - torch.deg2rad(torch.tensor(angle_y, device=device))
+    theta_new = torch.clamp(theta_new, 0.1, 3.0) # Prevent Gimbal Lock (poles)
+    
+    phi_new = phi - torch.deg2rad(torch.tensor(angle_x, device=device))
+    
+    # 4. Convert back to Cartesian
+    y_new = radius * torch.cos(theta_new)
+    h     = radius * torch.sin(theta_new) # Horizontal radius
+    x_new = h * torch.cos(phi_new)
+    z_new = h * torch.sin(phi_new)
+    
+    pos_new = torch.stack([x_new, y_new, z_new]) + center
+    
+    # 5. Robust LookAt Matrix Construction
+    # Forward (Z-axis): Points from Object TO Camera (OpenGL convention)
+    z_axis = F.normalize(center - pos_new, dim=0)
+    
+    # Global Up Vector
+    world_up = torch.tensor([0.0, 1.0, 0.0], device=device)
+    
+    # 【关键修改】：这里加一个负号，或者交换叉乘顺序！
+    # 原来是: x_axis = F.normalize(torch.cross(world_up, z_axis), dim=0)
+    # 因为 Z 轴反了导致 X 轴也反了，所以我们要手动把 X 轴掰回来：
+    x_axis = -F.normalize(torch.cross(world_up, z_axis), dim=0) 
+    
+    # Y 轴保持逻辑不变 (由 Z 和 X 决定)
+    y_axis = F.normalize(torch.cross(z_axis, x_axis), dim=0)
+    
+    new_c2w = torch.eye(4, device=device)
+    new_c2w[:3, 0] = x_axis
+    new_c2w[:3, 1] = y_axis
+    new_c2w[:3, 2] = z_axis
+    new_c2w[:3, 3] = pos_new
+    
+    return new_c2w
 
 def ssim(img1, img2, window_size=11, size_average=True):
     def gaussian(window_size, sigma):
@@ -243,146 +180,195 @@ def ssim(img1, img2, window_size=11, size_average=True):
     C1, C2 = 0.01 ** 2, 0.03 ** 2
     return (((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))).mean()
 
-def crop_and_resize_differentiable(img_tensor, mask_tensor, target_size=256, padding=0.1):
-    """
-    img_tensor: [1, 3, H, W]
-    mask_tensor: [1, 1, H, W] (用于计算 BBox)
-    """
-    # 1. 从 Mask 计算 BBox (这里为了简单，假设 batch_size=1)
-    # 注意：为了梯度反向传播，BBox 的坐标获取最好不要打断计算图，
-    # 但通常我们用 GT mask 或当前渲染的 detach mask 来定位置是没问题的。
-    
-    nonzero = torch.nonzero(mask_tensor[0, 0] > 0.5)
-    if nonzero.shape[0] == 0:
-        return F.interpolate(img_tensor, (target_size, target_size), mode='bilinear')
+# ==========================================
+# 2. Zero123 模块
+# ==========================================
 
-    y_min, x_min = torch.min(nonzero, dim=0)[0]
-    y_max, x_max = torch.max(nonzero, dim=0)[0]
-    
-    # 2. 变成正方形 BBox
-    center_y = (y_min + y_max) / 2.0
-    center_x = (x_min + x_max) / 2.0
-    height = y_max - y_min
-    width = x_max - x_min
-    side_length = max(height, width) * (1 + padding) # 加上一点 padding
-    
-    # 3. 构建 Grid 进行采样 (Crop)
-    # 我们需要构建一个变换矩阵，把 BBox 区域映射到 [-1, 1]
-    # Grid Sample 需要 normalized coordinates
-    H, W = img_tensor.shape[2], img_tensor.shape[3]
-    
-    # 计算 scale
-    s_x = side_length / W
-    s_y = side_length / H
-    
-    # 计算 translation (归一化坐标系下，中心是 0,0)
-    # 图像坐标 (cx, cy) -> 归一化坐标 (-1 + 2*cx/W, -1 + 2*cy/H)
-    t_x = -1 + 2 * center_x / W
-    t_y = -1 + 2 * center_y / H
-    
-    # 构建仿射矩阵 [B, 2, 3]
-    theta = torch.tensor([[
-        [s_x, 0,   t_x],
-        [0,   s_y, t_y]
-    ]], device=img_tensor.device, dtype=img_tensor.dtype)
-    
-    grid = F.affine_grid(theta, torch.Size([1, 3, target_size, target_size]), align_corners=False)
-    cropped_img = F.grid_sample(img_tensor, grid, align_corners=False)
-    
-    return cropped_img
-    
+class CLIPCameraProjection(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(772, 768) 
+        self.norm = nn.Identity()
 
-def get_orbit_camera(c2w, angle_x, angle_y, center=None, device='cuda'):
-    """
-    基于当前c2w，沿水平(azimuth)和垂直(elevation)方向旋转生成新视角
-    angle_x, angle_y: 角度（度数）
-    """
-    if center is None:
-        center = torch.zeros(3, device=device)
-    
-    # 提取旋转和平移
-    rot = c2w[:3, :3]
-    pos = c2w[:3, 3]
-    
-    # 计算当前相机相对于中心的半径向量
-    dir_vec = pos - center
-    radius = torch.norm(dir_vec)
-    
-    # 构建转换矩阵：先移回原点 -> 旋转 -> 移回原来的半径距离
-    # 这里简化处理：直接假设物体在原点附近，使用LookAt逻辑重新构建
-    
-    # 1. 将笛卡尔坐标转为球坐标 (r, theta, phi)
-    x, y, z = dir_vec[0], dir_vec[1], dir_vec[2]
-    r = torch.sqrt(x**2 + y**2 + z**2)
-    theta = torch.acos(y / r) # 极角 (与Y轴夹角, OpenGL坐标系Y通常为上/下)
-    phi = torch.atan2(z, x)   # 方位角
-    
-    # 2. 施加偏移 (注意弧度转换)
-    theta_new = theta + torch.deg2rad(torch.tensor(angle_y, device=device))
-    phi_new = phi + torch.deg2rad(torch.tensor(angle_x, device=device))
-    
-    # 限制 theta 防止万向节死锁
-    theta_new = torch.clamp(theta_new, 0.1, 3.1)
-    
-    # 3. 转回笛卡尔坐标 (新位置)
-    x_new = r * torch.sin(theta_new) * torch.cos(phi_new)
-    y_new = r * torch.cos(theta_new)
-    z_new = r * torch.sin(theta_new) * torch.sin(phi_new)
-    pos_new = torch.stack([x_new, y_new, z_new]) + center
-    
-    # 4. 构建 LookAt 矩阵 (新位置看向中心)
-    forward = F.normalize(center - pos_new, dim=0)
-    up = torch.tensor([0.0, 1.0, 0.0], device=device) # 假设Y轴向上
-    
-    # 如果forward和up平行，重新选择up
-    if torch.abs(torch.dot(forward, up)) > 0.99:
-        up = torch.tensor([0.0, 0.0, 1.0], device=device)
+    def forward(self, x):
+        return self.proj(x)
+
+class Zero123Guide(nn.Module):
+    def __init__(self, device, model_key="ashawkey/zero123-xl-diffusers"):
+        super().__init__()
+        self.device = device
+        self.dtype = torch.float16
         
-    right = F.normalize(torch.cross(forward, up), dim=0)
-    new_up = F.normalize(torch.cross(right, forward), dim=0)
-    
-    # 构建 c2w
-    new_c2w = torch.eye(4, device=device)
-    new_c2w[:3, 0] = right
-    new_c2w[:3, 1] = new_up # 注意: 有些系统是 -new_up，Zero123通常适应 OpenGL
-    new_c2w[:3, 2] = -forward # OpenGL 相机看向 -Z
-    new_c2w[:3, 3] = pos_new
-    
-    return new_c2w
+        print(f"[SDS] Initializing Zero123 Guidance...")
+        print(f"[SDS] Loading components from: {model_key}...")
+
+        try:
+            self.vae = AutoencoderKL.from_pretrained(
+                model_key, subfolder="vae", torch_dtype=self.dtype
+            ).to(device)
+            self.unet = UNet2DConditionModel.from_pretrained(
+                model_key, subfolder="unet", torch_dtype=self.dtype
+            ).to(device)
+            self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                model_key, subfolder="image_encoder", torch_dtype=self.dtype
+            ).to(device)
+            self.scheduler = DDPMScheduler.from_pretrained(
+                model_key, subfolder="scheduler"
+            )
+            self.cc_projection = CLIPCameraProjection().to(device, dtype=self.dtype)
+            
+            print("[SDS] Downloading camera projection weights (safetensors)...")
+            cc_path = hf_hub_download(
+                repo_id=model_key, 
+                filename="diffusion_pytorch_model.safetensors", 
+                subfolder="clip_camera_projection"
+            )
+            state_dict = load_file(cc_path)
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if "proj" in k or "linear" in k:
+                    new_state_dict["proj.weight"] = v if "weight" in k else new_state_dict.get("proj.weight")
+                    new_state_dict["proj.bias"] = v if "bias" in k else new_state_dict.get("proj.bias")
+                else:
+                    new_state_dict[k] = v
+            
+            if new_state_dict.get("proj.weight") is not None:
+                self.cc_projection.load_state_dict(new_state_dict, strict=True)
+                print("[SDS] Camera projection loaded successfully.")
+            else:
+                raise RuntimeError("Weight mismatch in camera projection.")
+
+        except Exception as e:
+            print(f"[Error] Failed to load components: {e}")
+            raise RuntimeError("Could not load Zero123 components.")
+
+        import gc; gc.collect(); torch.cuda.empty_cache()
+        self.min_step = 0.02
+        self.max_step = 0.98
+        self.ref_embeddings = None
+        self.c2w_ref = None
+
+    def get_cam_embeddings(self, elevation, azimuth, radius):
+        zero_tensor = torch.zeros_like(radius)
+        camera_pose = torch.stack([elevation, azimuth, radius, zero_tensor], dim=-1).to(self.device, dtype=self.dtype)
+        if self.ref_embeddings is None:
+             raise RuntimeError("Reference embeddings not initialized.")
+        batch_size = camera_pose.shape[0]
+        ref_emb_expanded = self.ref_embeddings.repeat(batch_size, 1)
+        mlp_input = torch.cat([ref_emb_expanded, camera_pose], dim=-1)
+        return self.cc_projection(mlp_input)
+
+    @torch.no_grad()
+    def prepare_condition(self, ref_image_tensor, c2w_ref):
+        """
+        ref_image_tensor: [1, 3, 256, 256], Range [0, 1]
+        """
+        # CLIP Branch
+        ref_img_224 = F.interpolate(ref_image_tensor, (224, 224), mode='bilinear', align_corners=False)
+        ref_img_norm_clip = T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))(ref_img_224)
+        self.ref_embeddings = self.image_encoder(ref_img_norm_clip).image_embeds.to(dtype=self.dtype)
+
+        # VAE Branch
+        ref_img_256 = F.interpolate(ref_image_tensor, (256, 256), mode='bilinear', align_corners=False)
+        ref_img_norm_vae = (ref_img_256 - 0.5) * 2
+        ref_img_norm_vae = ref_img_norm_vae.to(dtype=self.dtype)
+        self.ref_latents = self.vae.encode(ref_img_norm_vae).latent_dist.mode() * 0.18215
+        
+        self.c2w_ref = c2w_ref
+
+    def compute_relative_pose(self, c2w_curr):
+        T_ref = self.c2w_ref[:3, 3]
+        T_curr = c2w_curr[:3, 3]
+
+        def cartesian_to_spherical(xyz):
+            xy = torch.sqrt(xyz[0]**2 + xyz[2]**2)
+            elevation = torch.atan2(xyz[1], xy)
+            azimuth = torch.atan2(xyz[0], xyz[2])
+            radius = torch.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2)
+            return elevation, azimuth, radius
+
+        el_ref, az_ref, r_ref = cartesian_to_spherical(T_ref)
+        el_curr, az_curr, r_curr = cartesian_to_spherical(T_curr)
+        
+        d_azimuth = torch.rad2deg(az_curr - az_ref)
+        d_elevation = torch.rad2deg(el_curr - el_ref)
+        d_radius = torch.tensor(0.0, device=self.device)
+        
+        d_azimuth = (d_azimuth + 180) % 360 - 180
+        return d_elevation.unsqueeze(0), d_azimuth.unsqueeze(0), d_radius.unsqueeze(0)
+
+    def sds_loss(self, pred_rgb, relative_pose):
+        pred_256 = F.interpolate(pred_rgb, (256, 256), mode='bilinear', align_corners=False)
+        vae_input = (pred_256 - 0.5) * 2
+        vae_input = vae_input.to(dtype=self.dtype) 
+        
+        latents = self.vae.encode(vae_input).latent_dist.sample()
+        latents = latents * 0.18215
+        
+        noise = torch.randn_like(latents)
+        t = torch.randint(
+            int(self.min_step * self.scheduler.config.num_train_timesteps), 
+            int(self.max_step * self.scheduler.config.num_train_timesteps), 
+            [1], device=self.device
+        )
+        noisy_latents = self.scheduler.add_noise(latents, noise, t)
+        
+        latent_model_input = torch.cat([noisy_latents, self.ref_latents], dim=1)
+        
+        d_el, d_az, d_r = relative_pose
+        camera_embeddings = self.get_cam_embeddings(d_el, d_az, d_r)
+        
+        encoder_hidden_states = self.ref_embeddings.unsqueeze(1)
+        noise_pred = self.unet(
+            latent_model_input, 
+            t, 
+            encoder_hidden_states=encoder_hidden_states,
+            class_labels=camera_embeddings
+        ).sample
+
+        w = 1 - (t / self.scheduler.config.num_train_timesteps)
+        grad = w[:, None, None, None] * (noise_pred - noise)
+        grad = torch.nan_to_num(grad)
+        
+        latents_float = latents.float()
+        grad_float = grad.float()
+        target = (latents_float - grad_float).detach()
+        loss = 0.5 * F.mse_loss(latents_float, target, reduction="sum")
+        
+        return loss
+
+# ==========================================
+# 3. Gaussian Splatting Solver
+# ==========================================
 
 class GSSolver:
     def __init__(self, data_path: str, sam2_video_path: str, output_dir: str, focal_ratio: float = 0.8, use_sds: bool = True):
         self.device = torch.device("cuda:0")
         self.output_dir = output_dir
-        self.use_sds = use_sds # [NEW] Switch
+        self.use_sds = use_sds 
         
-        # [NEW] 创建分类子文件夹
         self.dir_params = os.path.join(self.output_dir, "params")
         self.dir_images = os.path.join(self.output_dir, "images")
         self.dir_depths = os.path.join(self.output_dir, "depths")
+        self.dir_debug = os.path.join(self.output_dir, "debug_sds") # [NEW] Debug folder
         os.makedirs(self.dir_params, exist_ok=True)
         os.makedirs(self.dir_images, exist_ok=True)
         os.makedirs(self.dir_depths, exist_ok=True)
+        os.makedirs(self.dir_debug, exist_ok=True)
         
         print(f"Output Directory set to: {self.output_dir}")
-
         print(f"Loading data from {data_path}...")
         data = np.load(data_path)
 
-        # 加载图像
         if 'images' in data: self.images = torch.from_numpy(data['images'].astype(np.float32) / 255.0).to(self.device)
         else: self.images = torch.from_numpy(data['image'].astype(np.float32) / 255.0).to(self.device)
         
-        # 加载深度
         depth_key = next((k for k in ['d', 'depth', 'depths'] if k in data), None)
         self.depths = torch.from_numpy(data[depth_key].astype(np.float32)).to(self.device)
         
-        # 加载位姿
         pose_key = 'cam_c2w' if 'cam_c2w' in data else 'c2w'
         self.c2ws = torch.from_numpy(data[pose_key].astype(np.float32)).to(self.device)
-        
-        # [Critical] 坐标系翻转: OpenCV -> OpenGL
-        self.c2ws[..., 0:3, 1:3] *= -1
+        self.c2ws[..., 0:3, 1:3] *= -1 # OpenCV -> OpenGL
         
         self.num_frames, self.H, self.W, _ = self.images.shape
         print(f"Data Loaded: {self.num_frames} frames, {self.W}x{self.H}")
@@ -398,35 +384,22 @@ class GSSolver:
             self.K = torch.tensor([[self.focal, 0, self.W / 2.0], [0, self.focal, self.H / 2.0], [0, 0, 1]], device=self.device)
             print(f"Warning: Using guessed focal length {self.focal:.2f}")
 
-        # 从 SAM2 视频加载 Mask
         self.gt_masks, self.core_masks = self._load_masks_from_video(sam2_video_path)
-        
-        if self.gt_masks is None:
-            print("Error: Masks failed to load from video.")
-            exit()
+        if self.gt_masks is None: exit()
 
         self.means_prev_all = None
         self.means_prev_2 = None
         self.knn_rigid_indices = None
         self.knn_rigid_weights = None
 
-        # [NEW] SDS Initialization
         if self.use_sds:
-            print("[SDS] Initializing Zero123 Guidance...")
+            print("[SDS] Initializing Zero123 Guidance Model...")
             self.guidance = Zero123Guide(self.device)
-            # Encode Reference Image (Frame 0)
-            # Permute to [1, 3, H, W]
-            ref_img = self.images[0].permute(2, 0, 1).unsqueeze(0)
-            ref_mask = self.gt_masks[0].permute(2, 0, 1).unsqueeze(0)
-            # Apply Mask to Ref Image (Black background usually better for Zero123)
-            ref_img_masked = ref_img * ref_mask
-            self.guidance.prepare_condition(ref_img_masked, self.c2ws[0])
-            print("[SDS] Reference image encoded.")
+            # [修正] 移除这里的 prepare_condition，改到 train_frame 中动态设置
 
         self._init_spheres()
 
     def _load_masks_from_video(self, video_path):
-        # ... (Keep existing mask loading code) ...
         print(f"Loading masks from video: {video_path}")
         if not os.path.exists(video_path):
             print(f"Error: Video file not found: {video_path}")
@@ -443,28 +416,20 @@ class GSSolver:
             if not ret: break
             if count >= self.num_frames: break 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
             if (gray.shape[1] != self.W) or (gray.shape[0] != self.H):
                 gray = cv2.resize(gray, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
             
             mask_np = (gray > 127).astype(np.uint8)
             core_np = cv2.erode(mask_np, kernel, iterations=1)
-            
             full_masks.append(torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(-1))
             core_masks.append(torch.from_numpy(core_np.astype(np.float32)).unsqueeze(-1))
             count += 1
             
         cap.release()
-        
         if len(full_masks) < self.num_frames:
-            print(f"Warning: Video frames ({len(full_masks)}) < NPZ frames ({self.num_frames}). Padding.")
-            last_full = full_masks[-1]
-            last_core = core_masks[-1]
+            last_full = full_masks[-1]; last_core = core_masks[-1]
             for _ in range(self.num_frames - len(full_masks)):
-                full_masks.append(last_full)
-                core_masks.append(last_core)
-
-        print(f"Loaded {len(full_masks)} masks from video.")
+                full_masks.append(last_full); core_masks.append(last_core)
         return torch.stack(full_masks).to(self.device), torch.stack(core_masks).to(self.device)
 
     def _align_shape(self, tensor):
@@ -472,7 +437,6 @@ class GSSolver:
         return tensor
 
     def _init_spheres(self):
-        # ... (Keep existing initialization code) ...
         print("Initializing Gaussian Ellipsoids (Anisotropic)...")
         idx = 0
         depth = self.depths[idx]
@@ -510,7 +474,6 @@ class GSSolver:
         print(f"[*] Initialized {N} Gaussians (Ellipsoids).")
 
     def _compute_knn(self, points, k=20):
-        # ... (Keep existing KNN code) ...
         indices = []
         dists = []
         chunk_size = 2000
@@ -522,17 +485,12 @@ class GSSolver:
                 val, idx = d.topk(k, dim=1, largest=False)
                 indices.append(idx)
                 dists.append(val)
-        knn_indices = torch.cat(indices, dim=0)
-        dist_sq = torch.cat(dists, dim=0) ** 2
-        knn_weights = torch.exp(-2000.0 * dist_sq)
-        return knn_indices, knn_weights
+        return torch.cat(indices, dim=0), torch.exp(-2000.0 * torch.cat(dists, dim=0) ** 2)
 
     def _densify_and_prune(self):
-        # ... (Keep existing densify code) ...
         with torch.no_grad():
             grads = self.grad_accum / self.denom
             grads[self.denom == 0] = 0.0
-            
             to_clone = grads >= 0.0004
             
             if to_clone.sum() > 0:
@@ -570,81 +528,83 @@ class GSSolver:
 
         l1_loss = nn.L1Loss()
         
+        # 数据准备
         gt_mask = self.gt_masks[frame_idx]
         core_mask = self.core_masks[frame_idx]
-        
         gt_img_raw = self.images[frame_idx]
         gt_img = gt_img_raw * gt_mask + (1.0 - gt_mask) * 1.0 
         
+        # [核心修复]：Zero123 Condition 准备
+        if self.use_sds:
+            # 1. 转为 [C, H, W]
+            ref_img_chw = gt_img_raw.permute(2, 0, 1) 
+            ref_mask_chw = gt_mask.permute(2, 0, 1)   
+            
+            # 2. 应用 Mask (背景置黑，更适合 Zero123)
+            ref_img_masked_raw = ref_img_chw * ref_mask_chw
+            
+            # 3. 裁剪并缩放 (居中物体，填充画面)
+            ref_img_crop = crop_image_by_mask(ref_img_masked_raw, ref_mask_chw)
+            
+            # 4. 传入 Condition (当前帧 Pose)
+            self.guidance.prepare_condition(ref_img_crop.unsqueeze(0), self.c2ws[frame_idx])
+            
+            # [Debug] 保存一下这一帧的参考图，确保裁剪正确
+            save_image(ref_img_crop, f"{self.dir_debug}/ref_crop_frame_{frame_idx:03d}.png")
+
         gt_d = self.depths[frame_idx].unsqueeze(-1)
-        
-        # 获取当前帧的GT位姿
         c2w_curr = self.c2ws[frame_idx]
         viewmat_gt = torch.inverse(c2w_curr)
-        
         bg_color = torch.tensor([1.0, 1.0, 1.0], device=self.device)
 
         lambda_depth = 0.2
-        
-        # [Config] SDS 配置
-        lambda_sds_base = 0.05  # 基础权重
-        max_angle_deg = 45.0    # 最大采样偏转角度
-        sds_interval = 10       # 每多少次迭代做一次新视角SDS
+        lambda_sds_base = 0.01
+        sds_warmup = 1000
+        max_angle_deg = 45.0
+        sds_interval = 10
         
         pbar = tqdm(range(iterations), desc=f"Frame {frame_idx}", leave=False)
         render_d_final = None 
 
         for i in pbar:
-            optimizer.zero_grad() # 显式清零
-            
+            optimizer.zero_grad()
             scales = self.radii 
             colors_precomp = torch.cat([torch.sigmoid(self.rgbs), torch.ones_like(self.rgbs[:, :1])], dim=1)
 
             # ==============================
-            # 1. 真实视角渲染 (GT View)
+            # 1. GT View 渲染
             # ==============================
             meta = rasterization(
                 self.means, F.normalize(self.quats, dim=-1), 
-                torch.exp(scales), 
-                torch.sigmoid(self.opacities), 
+                torch.exp(scales), torch.sigmoid(self.opacities), 
                 colors_precomp, 
-                viewmat_gt[None], self.K[None], self.W, self.H, 
-                packed=False
+                viewmat_gt[None], self.K[None], self.W, self.H, packed=False
             )
             render_rgba = self._align_shape(meta[0][0])
             render_rgb_fg = render_rgba[..., :3]
             render_alpha = render_rgba[..., 3:4]
             render_rgb = render_rgb_fg + bg_color * (1.0 - render_alpha)
 
-            # --- GT View Losses (L1 + SSIM + Mask) ---
-            loss_rgb = 0.8 * l1_loss(render_rgb, gt_img) + 0.2 * (1.0 - ssim(render_rgb.permute(2,0,1).unsqueeze(0), gt_img.permute(2,0,1).unsqueeze(0)))
-            loss = loss_rgb
+            loss = 0.8 * l1_loss(render_rgb, gt_img) + 0.2 * (1.0 - ssim(render_rgb.permute(2,0,1).unsqueeze(0), gt_img.permute(2,0,1).unsqueeze(0)))
 
             if core_mask.sum() > 0:
                 loss += 2.0 * l1_loss(render_alpha * core_mask, core_mask)
-
             bg_mask = 1.0 - gt_mask
             if bg_mask.sum() > 0:
                 loss += 5.0 * l1_loss(render_alpha * bg_mask, torch.zeros_like(bg_mask))
             
-            # --- Depth Loss ---
             if gt_mask.sum() > 0:
                 means_cam = self.means @ viewmat_gt[:3, :3].T + viewmat_gt[:3, 3]
                 d_cols = means_cam[:, 2:3].expand(-1, 3)
                 meta_d = rasterization(
                     self.means, F.normalize(self.quats, dim=-1), 
-                    torch.exp(scales), 
-                    torch.sigmoid(self.opacities), 
-                    d_cols, 
-                    viewmat_gt[None], self.K[None], self.W, self.H, packed=False
+                    torch.exp(scales), torch.sigmoid(self.opacities), 
+                    d_cols, viewmat_gt[None], self.K[None], self.W, self.H, packed=False
                 )
                 render_d = self._align_shape(meta_d[0][0][..., 0:1])
                 loss += lambda_depth * l1_loss(render_d * gt_mask, gt_d * gt_mask)
-                
-                if i == iterations - 1:
-                    render_d_final = render_d.detach()
+                if i == iterations - 1: render_d_final = render_d.detach()
 
-            # --- Rigidity Loss (保持不变) ---
             if frame_idx > 0 and self.knn_rigid_indices is not None:
                 n_prev = self.means_prev_all.shape[0]
                 curr_rigid = self.means[:n_prev]
@@ -656,80 +616,85 @@ class GSSolver:
                 dist_prev = torch.norm(neighbors_prev - prev_exp, dim=-1)
                 loss += 10.0 * (self.knn_rigid_weights * torch.abs(dist_curr - dist_prev)).mean()
 
-            # ===============================================
-            # 2. 新视角 SDS + 正则化 (Novel View Regularization)
-            # ===============================================
-            # 逻辑：不在GT视角做SDS。随机采样一个角度，角度越大权重越高。
-            
-            if self.use_sds and i % sds_interval == 0:
-                # A. 随机采样偏移角度 (环绕采样)
-                # 避开非常小的角度，因为那和GT太像了
+
+
+            # ==============================
+            # 2. SDS & Novel View
+            # ==============================
+            if self.use_sds and i % sds_interval == 0 and i > sds_warmup:
                 min_deg = 5.0
-                delta_azimuth = (torch.rand(1).item() * 2 - 1) * max_angle_deg # [-max, max]
-                delta_elevation = (torch.rand(1).item() * 2 - 1) * (max_angle_deg / 2.0) # [-max/2, max/2]
+                delta_azimuth = (torch.rand(1).item() * 2 - 1) * max_angle_deg 
+                delta_elevation = (torch.rand(1).item() * 2 - 1) * (max_angle_deg / 2.0)
+
                 
-                # 确保偏离足够大，否则不做SDS
                 total_angle_diff = np.sqrt(delta_azimuth**2 + delta_elevation**2)
                 
                 if total_angle_diff > min_deg:
-                    # B. 生成新相机位姿
-                    c2w_novel = get_orbit_camera(c2w_curr, delta_azimuth, delta_elevation, device=self.device)
+                    # [核心修复] 计算物体中心，防止相机看空
+
+                    object_center = torch.median(self.means.detach(), dim=0)[0]
+        
+                    # [或者] 如果你的数据做过归一化，车应该在原点，可以直接强行设为 0
+                    # object_center = torch.zeros(3, device=self.device) 
+                    
+                    # 调用新的 get_orbit_camera
+                    c2w_novel = get_orbit_camera(c2w_curr, delta_azimuth, delta_elevation, center=object_center, device=self.device)
+                    if torch.isnan(c2w_novel).any():
+                        print("WARNING: NaN detected in novel camera pose! Skipping SDS.")
+                        continue
+                    # [DEBUG] 打印新旧相机位置距离，如果离得特别远（比如几百米），说明飞了
+                    # dist_change = torch.norm(c2w_novel[:3,3] - c2w_curr[:3,3])
+
                     viewmat_novel = torch.inverse(c2w_novel)
                     
-                    # C. 渲染新视角
                     meta_novel = rasterization(
                         self.means, F.normalize(self.quats, dim=-1), 
-                        torch.exp(scales), 
-                        torch.sigmoid(self.opacities), 
+                        torch.exp(scales), torch.sigmoid(self.opacities), 
                         colors_precomp, 
-                        viewmat_novel[None], self.K[None], self.W, self.H, 
-                        packed=False
+                        viewmat_novel[None], self.K[None], self.W, self.H, packed=False
                     )
                     rgba_novel = self._align_shape(meta_novel[0][0])
                     rgb_novel = rgba_novel[..., :3] + bg_color * (1.0 - rgba_novel[..., 3:4])
                     
-                    # D. 准备 SDS 输入
-                    pred_img = rgb_novel.permute(2, 0, 1).unsqueeze(0) # [1, 3, H, W]
+                    pred_img = rgb_novel.permute(2, 0, 1).unsqueeze(0) 
                     pred_alpha = rgba_novel[..., 3:4].permute(2, 0, 1).unsqueeze(0)
     
-                    # 对预测图进行裁剪，使其物体居中
+                    # 对渲染结果也做 Crop，保证 Loss 计算时物体也是居中的
                     pred_img_centered = crop_and_resize_differentiable(pred_img, pred_alpha)
-                    # E. 计算动态权重
-                    # 距离GT越远，越依赖SDS。公式: weight = base * (diff / max_diff)
-                    # 加上一个基础bias确保有梯度
-                    dynamic_weight = lambda_sds_base * (0.5 + 1.5 * (total_angle_diff / max_angle_deg))
                     
-                    # F. 计算 SDS Loss
-                    # 注意: compute_relative_pose 应该计算 (Novel - Ref_Image_Frame0) 的关系
-                    # 这里把 c2w_novel 传进去即可
+                    dynamic_weight = lambda_sds_base * (0.5 + 1.5 * (total_angle_diff / max_angle_deg))
                     rel_pose = self.guidance.compute_relative_pose(c2w_novel)
                     loss_sds_val = self.guidance.sds_loss(pred_img_centered, rel_pose)
-                    
                     loss += dynamic_weight * loss_sds_val
                     
-                    # ===============================================
-                    # 3. 新视角图像质量正则化 (Opacity Sparsity)
-                    # ===============================================
-                    # 在新视角下，抑制半透明的“云雾”伪影。
-                    # 迫使 Opacity 趋向于 0 或 1
                     opacity_novel = rgba_novel[..., 3]
-                    # loss_sparsity = lambda * (o * log(o) + (1-o) * log(1-o)) 的简化版 -> mean(o * (1-o))
-                    # 或者简单的 L1 正则化鼓励稀疏
                     loss_sparsity = opacity_novel.mean() * 0.5 + (opacity_novel * (1.0 - opacity_novel)).mean() * 0.5
-                    
-                    loss += 0.01 * loss_sparsity * dynamic_weight # 权重随视角偏移增加
+                    loss += 0.01 * loss_sparsity * dynamic_weight
+
+                    # [Debug] 定期保存 Zero123 的输入图，检查是否看空
+                    if i % 500 == 0:
+                        save_image(pred_img_centered, f"{self.dir_debug}/frame_{frame_idx:03d}_iter_{i:04d}_novel.png")
+                        pcd = trimesh.points.PointCloud(self.means.detach().cpu().numpy())
+                        pcd.export(os.path.join(self.dir_debug, f"debug_scene_{i}.ply"))
+
+                        # 2. 保存相机位置 (画一个小球代表相机)
+                        cam_pos = c2w_novel[:3, 3].detach().cpu().numpy()
+                        # 也就是看看 cam_pos 离 pcd 的点云是不是十万八千里远
+                        cam_sphere = trimesh.creation.icosphere(radius=0.2)
+                        cam_sphere.apply_translation(cam_pos)
+                        cam_sphere.export(os.path.join(self.dir_debug, f"debug_cam_{i}.ply"))
+
+                        print(f"[DEBUG] Saved PLY files to {self.dir_debug}. Please visualize them!")
 
             loss.backward()
             optimizer.step()
             
-            # --- Densify Logic ---
             if allow_densify and i > 100 and i < iterations - 100 and i % 300 == 0:
                 if self.means.grad is not None:
                     self.grad_accum += torch.norm(self.means.grad[:, :2], dim=-1)
                     self.denom += 1.0
                 added = self._densify_and_prune()
                 if added:
-                    # Re-init optimizer params (keep logic simple)
                     optimizer = optim.Adam([
                         {'params': [self.means], 'lr': 0.00016},
                         {'params': [self.quats], 'lr': 0.001},
@@ -738,7 +703,6 @@ class GSSolver:
                         {'params': [self.opacities], 'lr': 0.05}
                     ], lr=0.001)
 
-        # 结束处理 (渲染最终图用于可视化)
         rgb_np = (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
         
         depth_np = None
@@ -752,7 +716,6 @@ class GSSolver:
         return rgb_np, depth_np
 
     def run(self):
-        # ... (Same as original) ...
         frames = []
         depth_frames = []
         
@@ -778,7 +741,6 @@ class GSSolver:
             
             img_pil = Image.fromarray(rgb_np)
             depth_pil = Image.fromarray(depth_np)
-            
             frames.append(img_pil)
             depth_frames.append(depth_pil)
             
@@ -797,13 +759,12 @@ class GSSolver:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gaussian Splatting Solver")
     
-    parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/learn-genmojo/data/car-turn/MegaSAM_Outputs/car-turn_sgd_cvd_hr.npz", help="Path to the npz data file")
-    parser.add_argument("--video_path", type=str, default="sam2.mp4", help="Path to the SAM2 video mask file")
-    parser.add_argument("--exp_name", type=str, default="default_exp", help="Name of the experiment")
-    parser.add_argument("--output_root", type=str, default="results", help="Root directory for results")
-    parser.add_argument("--focal_ratio", type=float, default=0.8, help="Focal length estimation ratio")
-    # [NEW] Argument
-    parser.add_argument("--use_sds", action="store_true", help="Enable Zero123 SDS Guidance")
+    parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/learn-genmojo/data/car-turn/MegaSAM_Outputs/car-turn_sgd_cvd_hr.npz")
+    parser.add_argument("--video_path", type=str, default="sam2_.mp4")
+    parser.add_argument("--exp_name", type=str, default="default_exp")
+    parser.add_argument("--output_root", type=str, default="results")
+    parser.add_argument("--focal_ratio", type=float, default=0.8)
+    parser.add_argument("--use_sds", action="store_true")
 
     args = parser.parse_args()
 
