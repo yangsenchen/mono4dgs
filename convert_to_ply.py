@@ -32,7 +32,6 @@ def save_ply_strict_padding(pt_path, output_path):
     ]
     
     # [关键修复] 添加 f_rest_0 到 f_rest_44 (共 45 个)
-    # 虽然你没训练这些，但必须占位，否则 Viewer 会报错或显示蓝色
     for i in range(45):
         dtype_list.append((f'f_rest_{i}', 'f4'))
 
@@ -71,14 +70,15 @@ def save_ply_strict_padding(pt_path, output_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", type=str, required=True, help="params 文件夹路径")
-    parser.add_argument("--output_dir", type=str, required=True, help="ply 输出路径")
+    parser.add_argument("--input_dir", type=str, required=True, help="params 文件夹路径 (生成的ply将保存在此目录下)")
+    # 已移除 output_dir 参数
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # 遍历 input_dir 下的所有 pt 文件
     files = sorted([f for f in os.listdir(args.input_dir) if f.endswith(".pt")])
     
     for f in files:
         pt_path = os.path.join(args.input_dir, f)
-        ply_path = os.path.join(args.output_dir, f.replace(".pt", ".ply"))
+        # 修改这里：将 output path 直接指向 input_dir
+        ply_path = os.path.join(args.input_dir, f.replace(".pt", ".ply"))
         save_ply_strict_padding(pt_path, ply_path)

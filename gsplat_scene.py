@@ -243,6 +243,112 @@ def ssim(img1, img2, window_size=11, size_average=True):
     C1, C2 = 0.01 ** 2, 0.03 ** 2
     return (((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))).mean()
 
+def crop_and_resize_differentiable(img_tensor, mask_tensor, target_size=256, padding=0.1):
+    """
+    img_tensor: [1, 3, H, W]
+    mask_tensor: [1, 1, H, W] (用于计算 BBox)
+    """
+    # 1. 从 Mask 计算 BBox (这里为了简单，假设 batch_size=1)
+    # 注意：为了梯度反向传播，BBox 的坐标获取最好不要打断计算图，
+    # 但通常我们用 GT mask 或当前渲染的 detach mask 来定位置是没问题的。
+    
+    nonzero = torch.nonzero(mask_tensor[0, 0] > 0.5)
+    if nonzero.shape[0] == 0:
+        return F.interpolate(img_tensor, (target_size, target_size), mode='bilinear')
+
+    y_min, x_min = torch.min(nonzero, dim=0)[0]
+    y_max, x_max = torch.max(nonzero, dim=0)[0]
+    
+    # 2. 变成正方形 BBox
+    center_y = (y_min + y_max) / 2.0
+    center_x = (x_min + x_max) / 2.0
+    height = y_max - y_min
+    width = x_max - x_min
+    side_length = max(height, width) * (1 + padding) # 加上一点 padding
+    
+    # 3. 构建 Grid 进行采样 (Crop)
+    # 我们需要构建一个变换矩阵，把 BBox 区域映射到 [-1, 1]
+    # Grid Sample 需要 normalized coordinates
+    H, W = img_tensor.shape[2], img_tensor.shape[3]
+    
+    # 计算 scale
+    s_x = side_length / W
+    s_y = side_length / H
+    
+    # 计算 translation (归一化坐标系下，中心是 0,0)
+    # 图像坐标 (cx, cy) -> 归一化坐标 (-1 + 2*cx/W, -1 + 2*cy/H)
+    t_x = -1 + 2 * center_x / W
+    t_y = -1 + 2 * center_y / H
+    
+    # 构建仿射矩阵 [B, 2, 3]
+    theta = torch.tensor([[
+        [s_x, 0,   t_x],
+        [0,   s_y, t_y]
+    ]], device=img_tensor.device, dtype=img_tensor.dtype)
+    
+    grid = F.affine_grid(theta, torch.Size([1, 3, target_size, target_size]), align_corners=False)
+    cropped_img = F.grid_sample(img_tensor, grid, align_corners=False)
+    
+    return cropped_img
+    
+
+def get_orbit_camera(c2w, angle_x, angle_y, center=None, device='cuda'):
+    """
+    基于当前c2w，沿水平(azimuth)和垂直(elevation)方向旋转生成新视角
+    angle_x, angle_y: 角度（度数）
+    """
+    if center is None:
+        center = torch.zeros(3, device=device)
+    
+    # 提取旋转和平移
+    rot = c2w[:3, :3]
+    pos = c2w[:3, 3]
+    
+    # 计算当前相机相对于中心的半径向量
+    dir_vec = pos - center
+    radius = torch.norm(dir_vec)
+    
+    # 构建转换矩阵：先移回原点 -> 旋转 -> 移回原来的半径距离
+    # 这里简化处理：直接假设物体在原点附近，使用LookAt逻辑重新构建
+    
+    # 1. 将笛卡尔坐标转为球坐标 (r, theta, phi)
+    x, y, z = dir_vec[0], dir_vec[1], dir_vec[2]
+    r = torch.sqrt(x**2 + y**2 + z**2)
+    theta = torch.acos(y / r) # 极角 (与Y轴夹角, OpenGL坐标系Y通常为上/下)
+    phi = torch.atan2(z, x)   # 方位角
+    
+    # 2. 施加偏移 (注意弧度转换)
+    theta_new = theta + torch.deg2rad(torch.tensor(angle_y, device=device))
+    phi_new = phi + torch.deg2rad(torch.tensor(angle_x, device=device))
+    
+    # 限制 theta 防止万向节死锁
+    theta_new = torch.clamp(theta_new, 0.1, 3.1)
+    
+    # 3. 转回笛卡尔坐标 (新位置)
+    x_new = r * torch.sin(theta_new) * torch.cos(phi_new)
+    y_new = r * torch.cos(theta_new)
+    z_new = r * torch.sin(theta_new) * torch.sin(phi_new)
+    pos_new = torch.stack([x_new, y_new, z_new]) + center
+    
+    # 4. 构建 LookAt 矩阵 (新位置看向中心)
+    forward = F.normalize(center - pos_new, dim=0)
+    up = torch.tensor([0.0, 1.0, 0.0], device=device) # 假设Y轴向上
+    
+    # 如果forward和up平行，重新选择up
+    if torch.abs(torch.dot(forward, up)) > 0.99:
+        up = torch.tensor([0.0, 0.0, 1.0], device=device)
+        
+    right = F.normalize(torch.cross(forward, up), dim=0)
+    new_up = F.normalize(torch.cross(right, forward), dim=0)
+    
+    # 构建 c2w
+    new_c2w = torch.eye(4, device=device)
+    new_c2w[:3, 0] = right
+    new_c2w[:3, 1] = new_up # 注意: 有些系统是 -new_up，Zero123通常适应 OpenGL
+    new_c2w[:3, 2] = -forward # OpenGL 相机看向 -Z
+    new_c2w[:3, 3] = pos_new
+    
+    return new_c2w
 
 class GSSolver:
     def __init__(self, data_path: str, sam2_video_path: str, output_dir: str, focal_ratio: float = 0.8, use_sds: bool = True):
@@ -471,29 +577,38 @@ class GSSolver:
         gt_img = gt_img_raw * gt_mask + (1.0 - gt_mask) * 1.0 
         
         gt_d = self.depths[frame_idx].unsqueeze(-1)
-        viewmat = torch.inverse(self.c2ws[frame_idx])
+        
+        # 获取当前帧的GT位姿
+        c2w_curr = self.c2ws[frame_idx]
+        viewmat_gt = torch.inverse(c2w_curr)
+        
         bg_color = torch.tensor([1.0, 1.0, 1.0], device=self.device)
 
         lambda_depth = 0.2
         
-        # [NEW] SDS 权重
-        lambda_sds = 0.05 
-
-        pbar = tqdm(range(iterations), desc=f"Frame {frame_idx}", leave=False)
+        # [Config] SDS 配置
+        lambda_sds_base = 0.05  # 基础权重
+        max_angle_deg = 45.0    # 最大采样偏转角度
+        sds_interval = 10       # 每多少次迭代做一次新视角SDS
         
+        pbar = tqdm(range(iterations), desc=f"Frame {frame_idx}", leave=False)
         render_d_final = None 
 
         for i in pbar:
+            optimizer.zero_grad() # 显式清零
+            
             scales = self.radii 
             colors_precomp = torch.cat([torch.sigmoid(self.rgbs), torch.ones_like(self.rgbs[:, :1])], dim=1)
 
-            # --- 1. RGB Rendering ---
+            # ==============================
+            # 1. 真实视角渲染 (GT View)
+            # ==============================
             meta = rasterization(
                 self.means, F.normalize(self.quats, dim=-1), 
                 torch.exp(scales), 
                 torch.sigmoid(self.opacities), 
                 colors_precomp, 
-                viewmat[None], self.K[None], self.W, self.H, 
+                viewmat_gt[None], self.K[None], self.W, self.H, 
                 packed=False
             )
             render_rgba = self._align_shape(meta[0][0])
@@ -501,7 +616,7 @@ class GSSolver:
             render_alpha = render_rgba[..., 3:4]
             render_rgb = render_rgb_fg + bg_color * (1.0 - render_alpha)
 
-            # Losses
+            # --- GT View Losses (L1 + SSIM + Mask) ---
             loss_rgb = 0.8 * l1_loss(render_rgb, gt_img) + 0.2 * (1.0 - ssim(render_rgb.permute(2,0,1).unsqueeze(0), gt_img.permute(2,0,1).unsqueeze(0)))
             loss = loss_rgb
 
@@ -512,26 +627,24 @@ class GSSolver:
             if bg_mask.sum() > 0:
                 loss += 5.0 * l1_loss(render_alpha * bg_mask, torch.zeros_like(bg_mask))
             
-            # --- 2. Depth Rendering & Loss ---
+            # --- Depth Loss ---
             if gt_mask.sum() > 0:
-                means_cam = self.means @ viewmat[:3, :3].T + viewmat[:3, 3]
+                means_cam = self.means @ viewmat_gt[:3, :3].T + viewmat_gt[:3, 3]
                 d_cols = means_cam[:, 2:3].expand(-1, 3)
-                
                 meta_d = rasterization(
                     self.means, F.normalize(self.quats, dim=-1), 
                     torch.exp(scales), 
                     torch.sigmoid(self.opacities), 
                     d_cols, 
-                    viewmat[None], self.K[None], self.W, self.H, packed=False
+                    viewmat_gt[None], self.K[None], self.W, self.H, packed=False
                 )
                 render_d = self._align_shape(meta_d[0][0][..., 0:1])
-                
                 loss += lambda_depth * l1_loss(render_d * gt_mask, gt_d * gt_mask)
                 
                 if i == iterations - 1:
                     render_d_final = render_d.detach()
 
-            # --- 3. Rigidity Loss ---
+            # --- Rigidity Loss (保持不变) ---
             if frame_idx > 0 and self.knn_rigid_indices is not None:
                 n_prev = self.means_prev_all.shape[0]
                 curr_rigid = self.means[:n_prev]
@@ -543,33 +656,80 @@ class GSSolver:
                 dist_prev = torch.norm(neighbors_prev - prev_exp, dim=-1)
                 loss += 10.0 * (self.knn_rigid_weights * torch.abs(dist_curr - dist_prev)).mean()
 
-            # --- [NEW] 4. SDS Loss (Zero123) ---
-            # 仅在非第一帧，或者为了增强第一帧的新视角质量时使用
-            # 通常我们在 frame_idx > 0 时使用，确保移动后的物体符合 3D 一致性
-            if self.use_sds and i % 20 == 0: # 减少频率以节省显存和时间
-                # 转换 render_rgb 到 [1, 3, H, W]
-                pred_img = render_rgb.permute(2, 0, 1).unsqueeze(0)
-                
-                # 计算相对姿态
-                rel_pose = self.guidance.compute_relative_pose(self.c2ws[frame_idx])
-                
-                # 计算 SDS Loss
-                loss_sds_val = self.guidance.sds_loss(pred_img, rel_pose)
-                
-                loss += lambda_sds * loss_sds_val
-                
-                # 可选：打印 loss
-                if i % 100 == 0:
-                    tqdm.write(f"Iter {i}, SDS Loss: {loss_sds_val.item():.4f}")
-
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            # ===============================================
+            # 2. 新视角 SDS + 正则化 (Novel View Regularization)
+            # ===============================================
+            # 逻辑：不在GT视角做SDS。随机采样一个角度，角度越大权重越高。
             
+            if self.use_sds and i % sds_interval == 0:
+                # A. 随机采样偏移角度 (环绕采样)
+                # 避开非常小的角度，因为那和GT太像了
+                min_deg = 5.0
+                delta_azimuth = (torch.rand(1).item() * 2 - 1) * max_angle_deg # [-max, max]
+                delta_elevation = (torch.rand(1).item() * 2 - 1) * (max_angle_deg / 2.0) # [-max/2, max/2]
+                
+                # 确保偏离足够大，否则不做SDS
+                total_angle_diff = np.sqrt(delta_azimuth**2 + delta_elevation**2)
+                
+                if total_angle_diff > min_deg:
+                    # B. 生成新相机位姿
+                    c2w_novel = get_orbit_camera(c2w_curr, delta_azimuth, delta_elevation, device=self.device)
+                    viewmat_novel = torch.inverse(c2w_novel)
+                    
+                    # C. 渲染新视角
+                    meta_novel = rasterization(
+                        self.means, F.normalize(self.quats, dim=-1), 
+                        torch.exp(scales), 
+                        torch.sigmoid(self.opacities), 
+                        colors_precomp, 
+                        viewmat_novel[None], self.K[None], self.W, self.H, 
+                        packed=False
+                    )
+                    rgba_novel = self._align_shape(meta_novel[0][0])
+                    rgb_novel = rgba_novel[..., :3] + bg_color * (1.0 - rgba_novel[..., 3:4])
+                    
+                    # D. 准备 SDS 输入
+                    pred_img = rgb_novel.permute(2, 0, 1).unsqueeze(0) # [1, 3, H, W]
+                    pred_alpha = rgba_novel[..., 3:4].permute(2, 0, 1).unsqueeze(0)
+    
+                    # 对预测图进行裁剪，使其物体居中
+                    pred_img_centered = crop_and_resize_differentiable(pred_img, pred_alpha)
+                    # E. 计算动态权重
+                    # 距离GT越远，越依赖SDS。公式: weight = base * (diff / max_diff)
+                    # 加上一个基础bias确保有梯度
+                    dynamic_weight = lambda_sds_base * (0.5 + 1.5 * (total_angle_diff / max_angle_deg))
+                    
+                    # F. 计算 SDS Loss
+                    # 注意: compute_relative_pose 应该计算 (Novel - Ref_Image_Frame0) 的关系
+                    # 这里把 c2w_novel 传进去即可
+                    rel_pose = self.guidance.compute_relative_pose(c2w_novel)
+                    loss_sds_val = self.guidance.sds_loss(pred_img_centered, rel_pose)
+                    
+                    loss += dynamic_weight * loss_sds_val
+                    
+                    # ===============================================
+                    # 3. 新视角图像质量正则化 (Opacity Sparsity)
+                    # ===============================================
+                    # 在新视角下，抑制半透明的“云雾”伪影。
+                    # 迫使 Opacity 趋向于 0 或 1
+                    opacity_novel = rgba_novel[..., 3]
+                    # loss_sparsity = lambda * (o * log(o) + (1-o) * log(1-o)) 的简化版 -> mean(o * (1-o))
+                    # 或者简单的 L1 正则化鼓励稀疏
+                    loss_sparsity = opacity_novel.mean() * 0.5 + (opacity_novel * (1.0 - opacity_novel)).mean() * 0.5
+                    
+                    loss += 0.01 * loss_sparsity * dynamic_weight # 权重随视角偏移增加
+
+            loss.backward()
+            optimizer.step()
+            
+            # --- Densify Logic ---
             if allow_densify and i > 100 and i < iterations - 100 and i % 300 == 0:
                 if self.means.grad is not None:
                     self.grad_accum += torch.norm(self.means.grad[:, :2], dim=-1)
                     self.denom += 1.0
                 added = self._densify_and_prune()
                 if added:
+                    # Re-init optimizer params (keep logic simple)
                     optimizer = optim.Adam([
                         {'params': [self.means], 'lr': 0.00016},
                         {'params': [self.quats], 'lr': 0.001},
@@ -578,6 +738,7 @@ class GSSolver:
                         {'params': [self.opacities], 'lr': 0.05}
                     ], lr=0.001)
 
+        # 结束处理 (渲染最终图用于可视化)
         rgb_np = (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
         
         depth_np = None
