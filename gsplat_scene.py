@@ -27,6 +27,194 @@ from safetensors.torch import load_file
 # 1. 辅助工具函数
 # ==========================================
 
+def compute_lookat_c2w(camera_pos, target_pos, up_vector=None):
+    """
+    LookAt 函数 (适配您的 gsplat 设置：Z轴指向物体)
+    """
+    if up_vector is None:
+        up_vector = torch.tensor([0.0, 1.0, 0.0], device=camera_pos.device, dtype=torch.float32)
+    
+    # 【修复】：按照您原始代码的逻辑，Z轴指向物体 (Forward)
+    z_axis = F.normalize(target_pos - camera_pos, dim=0) 
+    
+    # 【修复】：计算 X 轴 (Right)
+    # 原始代码逻辑是 -cross(up, z)，这里保持一致
+    x_axis = -F.normalize(torch.cross(up_vector, z_axis, dim=0), dim=0)
+    
+    # 计算 Y 轴 (Down/Up)
+    y_axis = F.normalize(torch.cross(z_axis, x_axis, dim=0), dim=0)
+    
+    c2w = torch.eye(4, device=camera_pos.device, dtype=torch.float32)
+    c2w[:3, 0] = x_axis
+    c2w[:3, 1] = y_axis
+    c2w[:3, 2] = z_axis
+    c2w[:3, 3] = camera_pos
+    
+    return c2w
+
+def compute_per_point_depth_loss(means, gt_depth, gt_mask, viewmat, K, W, H, margin=0.1):
+    """
+    逐点深度约束：直接约束每个高斯点的深度贴合GT深度
+    
+    核心思路：
+    1. 对于每个高斯点，投影到图像平面得到 (u, v)
+    2. 查询该像素位置的GT深度 d_gt
+    3. 约束高斯点的相机坐标系深度 z 等于 d_gt
+    
+    Args:
+        means: [N, 3] 高斯点3D位置（世界坐标系）
+        gt_depth: [H, W, 1] GT深度图
+        gt_mask: [H, W, 1] 物体mask
+        viewmat: [4, 4] 相机view矩阵
+        K: [3, 3] 相机内参
+        W, H: 图像尺寸
+        margin: 只对mask内部的点施加约束
+    
+    Returns:
+        loss: 标量损失值
+    """
+    N = means.shape[0]
+    device = means.device
+    
+    # Step 1: 将高斯点从世界坐标系变换到相机坐标系
+    # viewmat = inverse(c2w), 所以 p_cam = viewmat @ p_world
+    means_homo = torch.cat([means, torch.ones(N, 1, device=device)], dim=-1)  # [N, 4]
+    means_cam = (viewmat @ means_homo.T).T[:, :3]  # [N, 3]
+    
+    z_cam = means_cam[:, 2]  # 高斯点在相机坐标系的深度
+    
+    # Step 2: 投影到图像平面
+    # p_img = K @ p_cam (齐次除法)
+    means_2d = means_cam @ K.T  # [N, 3]
+    u = means_2d[:, 0] / (means_2d[:, 2] + 1e-8)  # x / z
+    v = means_2d[:, 1] / (means_2d[:, 2] + 1e-8)  # y / z
+    
+    # Step 3: 过滤有效点（在图像内部、深度为正、在mask内）
+    valid_depth = z_cam > 0.01
+    valid_u = (u >= 0) & (u < W - 1)
+    valid_v = (v >= 0) & (v < H - 1)
+    valid_proj = valid_depth & valid_u & valid_v
+    
+    if valid_proj.sum() < 10:
+        return torch.tensor(0.0, device=device)
+    
+    # Step 4: 采样GT深度（双线性插值）
+    # 转换为归一化坐标 [-1, 1] for grid_sample
+    u_norm = (2.0 * u / (W - 1) - 1.0)
+    v_norm = (2.0 * v / (H - 1) - 1.0)
+    grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)  # [1, 1, N, 2]
+    
+    # gt_depth: [H, W, 1] -> [1, 1, H, W]
+    gt_depth_4d = gt_depth.squeeze(-1).unsqueeze(0).unsqueeze(0)
+    gt_mask_4d = gt_mask.squeeze(-1).unsqueeze(0).unsqueeze(0)
+    
+    # 采样得到每个点对应的GT深度和mask
+    sampled_depth = F.grid_sample(gt_depth_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    sampled_mask = F.grid_sample(gt_mask_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    
+    sampled_depth = sampled_depth.squeeze()  # [N]
+    sampled_mask = sampled_mask.squeeze()    # [N]
+    
+    # Step 5: 只对mask内且投影有效的点计算loss
+    valid_mask = valid_proj & (sampled_mask > 0.5) & (sampled_depth > 0.01)
+    
+    if valid_mask.sum() < 10:
+        return torch.tensor(0.0, device=device)
+    
+    # Step 6: 计算深度差异loss（L1 或 L2）
+    z_diff = torch.abs(z_cam[valid_mask] - sampled_depth[valid_mask])
+    loss = z_diff.mean()
+    
+    return loss
+
+
+def compute_depth_pull_loss(means, gt_depth, gt_mask, viewmat, K, W, H, c2w, strength=1.0):
+    """
+    深度拉扯约束：直接计算每个高斯点"应该在的正确位置"，然后约束点向那个位置移动
+    
+    这是更强力的版本：不仅惩罚深度差异，还计算正确的3D目标位置
+    
+    Args:
+        means: [N, 3] 高斯点3D位置（世界坐标系）
+        gt_depth: [H, W, 1] GT深度图
+        gt_mask: [H, W, 1] 物体mask
+        viewmat: [4, 4] 相机view矩阵
+        K: [3, 3] 相机内参
+        W, H: 图像尺寸
+        c2w: [4, 4] 相机到世界变换矩阵
+        strength: loss强度
+    
+    Returns:
+        loss: 标量损失值
+    """
+    N = means.shape[0]
+    device = means.device
+    
+    # Step 1: 将高斯点从世界坐标系变换到相机坐标系
+    means_homo = torch.cat([means, torch.ones(N, 1, device=device)], dim=-1)  # [N, 4]
+    means_cam = (viewmat @ means_homo.T).T[:, :3]  # [N, 3]
+    
+    z_cam = means_cam[:, 2]  # 高斯点在相机坐标系的深度
+    
+    # Step 2: 投影到图像平面
+    means_2d = means_cam @ K.T  # [N, 3]
+    u = means_2d[:, 0] / (means_2d[:, 2] + 1e-8)  # x / z
+    v = means_2d[:, 1] / (means_2d[:, 2] + 1e-8)  # y / z
+    
+    # Step 3: 过滤有效点
+    valid_depth = z_cam > 0.01
+    valid_u = (u >= 0) & (u < W - 1)
+    valid_v = (v >= 0) & (v < H - 1)
+    valid_proj = valid_depth & valid_u & valid_v
+    
+    if valid_proj.sum() < 10:
+        return torch.tensor(0.0, device=device)
+    
+    # Step 4: 采样GT深度
+    u_norm = (2.0 * u / (W - 1) - 1.0)
+    v_norm = (2.0 * v / (H - 1) - 1.0)
+    grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
+    
+    gt_depth_4d = gt_depth.squeeze(-1).unsqueeze(0).unsqueeze(0)
+    gt_mask_4d = gt_mask.squeeze(-1).unsqueeze(0).unsqueeze(0)
+    
+    sampled_depth = F.grid_sample(gt_depth_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+    sampled_mask = F.grid_sample(gt_mask_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+    
+    # Step 5: 只对mask内且投影有效的点计算loss
+    valid_mask = valid_proj & (sampled_mask > 0.5) & (sampled_depth > 0.01)
+    
+    if valid_mask.sum() < 10:
+        return torch.tensor(0.0, device=device)
+    
+    # Step 6: 计算目标位置（在相机坐标系中）
+    # 目标深度 = GT深度，目标xy = 当前点的xy方向 * (目标深度 / 当前深度)
+    # 这样保持射线方向，只改变沿射线的距离
+    
+    target_z = sampled_depth[valid_mask]
+    current_z = z_cam[valid_mask]
+    
+    # 方法1：直接约束深度差（简单有效）
+    depth_loss = torch.abs(current_z - target_z).mean()
+    
+    # 方法2：计算完整的3D目标位置并约束（更强力）
+    # 目标点在相机坐标系中的位置
+    scale_factor = target_z / (current_z + 1e-8)
+    scale_factor = torch.clamp(scale_factor, 0.1, 10.0)  # 防止极端缩放
+    
+    means_cam_valid = means_cam[valid_mask]
+    target_cam = means_cam_valid * scale_factor.unsqueeze(-1)
+    
+    # 转换回世界坐标系
+    target_cam_homo = torch.cat([target_cam, torch.ones(target_cam.shape[0], 1, device=device)], dim=-1)
+    target_world = (c2w @ target_cam_homo.T).T[:, :3]
+    
+    # 计算当前位置与目标位置的L2距离
+    position_loss = torch.norm(means[valid_mask] - target_world, dim=-1).mean()
+    
+    return strength * (depth_loss + 0.5 * position_loss)
+
+
 def crop_image_by_mask(image_tensor, mask_tensor, target_size=256, padding=0.1):
     """
     [核心修复] 非微分裁剪，仅用于处理参考图 Condition。
@@ -376,11 +564,13 @@ class GaussianSplattingSolver:
         
         self.dir_params = os.path.join(self.output_dir, "params")
         self.dir_images = os.path.join(self.output_dir, "images")
+        self.dir_videos = os.path.join(self.output_dir, "videos")
         self.dir_depths = os.path.join(self.output_dir, "depths")
-        self.dir_debug = os.path.join(self.output_dir, "debug_sds") # [NEW] Debug folder
+        self.dir_debug = os.path.join(self.output_dir, "debug_sds")
         os.makedirs(self.dir_params, exist_ok=True)
         os.makedirs(self.dir_images, exist_ok=True)
         os.makedirs(self.dir_depths, exist_ok=True)
+        os.makedirs(self.dir_videos, exist_ok=True)
         os.makedirs(self.dir_debug, exist_ok=True)
         
         print(f"Output Directory set to: {self.output_dir}")
@@ -517,7 +707,10 @@ class GaussianSplattingSolver:
                 dists.append(val)
         return torch.cat(indices, dim=0), torch.exp(-2000.0 * torch.cat(dists, dim=0) ** 2)
 
-    def _densify_and_prune(self):
+    def _densify_and_prune(self, frame_idx=0, prune_depth_outliers=True):
+        """
+        Densify高梯度点，并剔除深度异常值
+        """
         with torch.no_grad():
             grads = self.grad_accum / self.denom
             grads[self.denom == 0] = 0.0
@@ -530,9 +723,152 @@ class GaussianSplattingSolver:
                 self.quats = torch.cat([self.quats, self.quats[to_clone]]).detach().requires_grad_(True)
                 self.opacities = torch.cat([self.opacities, self.opacities[to_clone]]).detach().requires_grad_(True)
             
+            # ==============================
+            # [新增] 深度异常值剔除
+            # 检测并删除严重偏离GT深度的高斯点
+            # ==============================
+            if prune_depth_outliers and hasattr(self, 'depths') and hasattr(self, 'gt_masks'):
+                depth_outlier_mask = self._detect_depth_outliers(frame_idx, threshold=0.5)
+                if depth_outlier_mask.sum() > 0:
+                    keep_mask = ~depth_outlier_mask
+                    print(f"[Prune] Removing {depth_outlier_mask.sum().item()} depth outliers out of {self.means.shape[0]} points")
+                    self.means = self.means[keep_mask].detach().requires_grad_(True)
+                    self.radii = self.radii[keep_mask].detach().requires_grad_(True)
+                    self.rgbs = self.rgbs[keep_mask].detach().requires_grad_(True)
+                    self.quats = self.quats[keep_mask].detach().requires_grad_(True)
+                    self.opacities = self.opacities[keep_mask].detach().requires_grad_(True)
+            
             self.grad_accum = torch.zeros(self.means.shape[0], device=self.device)
             self.denom = torch.zeros(self.means.shape[0], device=self.device)
             return to_clone.sum() > 0
+    
+    def _detect_depth_outliers(self, frame_idx, threshold=0.5):
+        """
+        检测深度异常值：投影到图像平面后，深度与GT深度差异超过阈值的点
+        
+        Args:
+            frame_idx: 当前帧索引
+            threshold: 深度差异阈值（相对误差）
+        
+        Returns:
+            outlier_mask: [N] bool tensor，True表示是异常值
+        """
+        N = self.means.shape[0]
+        device = self.device
+        
+        gt_depth = self.depths[frame_idx].unsqueeze(-1)  # [H, W, 1]
+        gt_mask = self.gt_masks[frame_idx]  # [H, W, 1]
+        c2w = self.c2ws[frame_idx]
+        viewmat = torch.inverse(c2w)
+        
+        # 将高斯点变换到相机坐标系
+        means_homo = torch.cat([self.means, torch.ones(N, 1, device=device)], dim=-1)
+        means_cam = (viewmat @ means_homo.T).T[:, :3]
+        z_cam = means_cam[:, 2]
+        
+        # 投影到图像平面
+        means_2d = means_cam @ self.K.T
+        u = means_2d[:, 0] / (means_2d[:, 2] + 1e-8)
+        v = means_2d[:, 1] / (means_2d[:, 2] + 1e-8)
+        
+        # 过滤有效投影
+        valid_depth = z_cam > 0.01
+        valid_u = (u >= 0) & (u < self.W - 1)
+        valid_v = (v >= 0) & (v < self.H - 1)
+        valid_proj = valid_depth & valid_u & valid_v
+        
+        # 采样GT深度
+        u_norm = (2.0 * u / (self.W - 1) - 1.0)
+        v_norm = (2.0 * v / (self.H - 1) - 1.0)
+        grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
+        
+        gt_depth_4d = gt_depth.squeeze(-1).unsqueeze(0).unsqueeze(0)
+        gt_mask_4d = gt_mask.squeeze(-1).unsqueeze(0).unsqueeze(0)
+        
+        sampled_depth = F.grid_sample(gt_depth_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+        sampled_mask = F.grid_sample(gt_mask_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+        
+        # 计算相对深度误差
+        rel_error = torch.abs(z_cam - sampled_depth) / (sampled_depth + 1e-8)
+        
+        # 异常值判定：在mask内且投影有效，但深度误差超过阈值
+        is_outlier = valid_proj & (sampled_mask > 0.5) & (sampled_depth > 0.01) & (rel_error > threshold)
+        
+        return is_outlier
+    
+    def _snap_points_to_depth(self, frame_idx, snap_ratio=0.3):
+        """
+        [强力深度对齐] 将高斯点强制拉到GT深度上
+        
+        这个函数会修改高斯点的位置，使其沿着射线方向移动到正确深度
+        只移动一部分距离（snap_ratio），避免破坏已有的优化结果
+        
+        Args:
+            frame_idx: 当前帧索引
+            snap_ratio: 移动多少比例向目标深度 (0.0=不动, 1.0=完全对齐)
+        """
+        N = self.means.shape[0]
+        device = self.device
+        
+        gt_depth = self.depths[frame_idx].unsqueeze(-1)
+        gt_mask = self.gt_masks[frame_idx]
+        c2w = self.c2ws[frame_idx]
+        viewmat = torch.inverse(c2w)
+        
+        # 变换到相机坐标系
+        means_homo = torch.cat([self.means.data, torch.ones(N, 1, device=device)], dim=-1)
+        means_cam = (viewmat @ means_homo.T).T[:, :3]
+        z_cam = means_cam[:, 2]
+        
+        # 投影
+        means_2d = means_cam @ self.K.T
+        u = means_2d[:, 0] / (means_2d[:, 2] + 1e-8)
+        v = means_2d[:, 1] / (means_2d[:, 2] + 1e-8)
+        
+        # 有效性检查
+        valid_depth = z_cam > 0.01
+        valid_u = (u >= 0) & (u < self.W - 1)
+        valid_v = (v >= 0) & (v < self.H - 1)
+        valid_proj = valid_depth & valid_u & valid_v
+        
+        # 采样GT深度
+        u_norm = (2.0 * u / (self.W - 1) - 1.0)
+        v_norm = (2.0 * v / (self.H - 1) - 1.0)
+        grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
+        
+        gt_depth_4d = gt_depth.squeeze(-1).unsqueeze(0).unsqueeze(0)
+        gt_mask_4d = gt_mask.squeeze(-1).unsqueeze(0).unsqueeze(0)
+        
+        sampled_depth = F.grid_sample(gt_depth_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+        sampled_mask = F.grid_sample(gt_mask_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+        
+        # 只对mask内的有效点进行对齐
+        snap_mask = valid_proj & (sampled_mask > 0.5) & (sampled_depth > 0.01)
+        
+        if snap_mask.sum() < 10:
+            return
+        
+        # 计算目标位置：沿射线方向缩放到目标深度
+        target_z = sampled_depth[snap_mask]
+        current_z = z_cam[snap_mask]
+        
+        scale_factor = target_z / (current_z + 1e-8)
+        scale_factor = torch.clamp(scale_factor, 0.1, 10.0)
+        
+        # 只移动 snap_ratio 的距离
+        interp_scale = 1.0 + snap_ratio * (scale_factor - 1.0)
+        
+        # 计算新的相机坐标系位置
+        means_cam_snap = means_cam[snap_mask] * interp_scale.unsqueeze(-1)
+        
+        # 转换回世界坐标系
+        means_cam_snap_homo = torch.cat([means_cam_snap, torch.ones(means_cam_snap.shape[0], 1, device=device)], dim=-1)
+        means_world_snap = (c2w @ means_cam_snap_homo.T).T[:, :3]
+        
+        # 更新高斯点位置
+        self.means.data[snap_mask] = means_world_snap
+        
+        print(f"[Snap] Moved {snap_mask.sum().item()} points toward GT depth (ratio={snap_ratio})")
 
     def save_params(self, frame_idx):
         save_path = os.path.join(self.dir_params, f"gaussians_{frame_idx:03d}.pt")
@@ -544,6 +880,87 @@ class GaussianSplattingSolver:
             'opacities': self.opacities.detach().cpu(),
             'num_points': self.means.shape[0]
         }, save_path)
+
+
+
+    def render_freewheel_video(self, frame_idx, video_length=60, scale_factor=0.8):
+        save_path = os.path.join(self.dir_videos, f"frame_{frame_idx:03d}_novel.mp4")
+        temp_path = os.path.join(self.dir_videos, f"frame_{frame_idx:03d}_novel_temp.mp4")
+        # 先用 mp4v 生成临时文件，后面用 ffmpeg 转成 H.264
+        writer = cv2.VideoWriter(temp_path, cv2.VideoWriter_fourcc(*'mp4v'), 30, (self.W, self.H))
+        
+        # 1. 确定物体中心
+        if self.means.shape[0] > 0:
+            object_center = torch.median(self.means.detach(), dim=0)[0]
+        else:
+            object_center = torch.zeros(3, device=self.device, dtype=torch.float32)
+            
+        c2w_curr = self.c2ws[frame_idx]
+        cam_pos_curr = c2w_curr[:3, 3]
+        
+        # 2. 获取当前相机的基向量（直接从矩阵取，保证方向和当前帧一致）
+        # c2w 列向量: 0:Right, 1:Up/Down, 2:Forward/Back
+        current_right = F.normalize(c2w_curr[:3, 0], dim=0)
+        current_up    = F.normalize(c2w_curr[:3, 1], dim=0)
+        
+        original_radius = torch.norm(cam_pos_curr - object_center)
+        world_up = torch.tensor([0.0, 1.0, 0.0], device=self.device, dtype=torch.float32)
+        bg_color = torch.tensor([1.0, 1.0, 1.0], device=self.device, dtype=torch.float32)
+        
+        scales = torch.exp(self.radii)
+        opacities = torch.sigmoid(self.opacities)
+        colors = torch.cat([torch.sigmoid(self.rgbs), torch.ones_like(self.rgbs[:, :1])], dim=1)
+        
+        print(f"[Novel View] Rendering Figure-8 video for frame {frame_idx}...")
+        
+        with torch.no_grad():
+            for t_step in range(video_length):
+                t = 2.0 * np.pi * float(t_step) / float(video_length)
+                
+                # 在相机平面内晃动
+                # 使用当前相机的 Right 和 Up 向量进行偏移，确保相对运动自然
+                offset_x = scale_factor * np.sin(t)
+                offset_y = (scale_factor * 0.5) * np.sin(2 * t)
+                
+                pos_temp = cam_pos_curr + current_right * offset_x + current_up * offset_y
+                
+                # 投射回球面上，保持距离不变
+                direction_to_center = F.normalize(object_center - pos_temp, dim=0) # 指向物体
+                pos_new = object_center - direction_to_center * original_radius
+                
+                # 计算 LookAt (使用修复后的函数)
+                c2w_novel = compute_lookat_c2w(pos_new, object_center, world_up)
+                
+                viewmat_novel = torch.inverse(c2w_novel)
+                
+                meta = rasterization(
+                    self.means, F.normalize(self.quats, dim=-1), 
+                    scales, opacities, 
+                    colors, 
+                    viewmat_novel[None], self.K[None], self.W, self.H, packed=False
+                )
+                
+                rgba = self._align_shape(meta[0][0])
+                rgb = rgba[..., :3] + bg_color * (1.0 - rgba[..., 3:4])
+                
+                rgb_np = (rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                rgb_bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
+                writer.write(rgb_bgr)
+                
+        writer.release()
+        
+        # 用 ffmpeg 转码为 H.264，使浏览器可以预览
+        import subprocess
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-i', temp_path,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-pix_fmt', 'yuv420p', save_path
+        ]
+        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.remove(temp_path)  # 删除临时文件
+        
+        print(f"[Novel View] Saved video to {save_path}")
+
 
     def train_frame(self, frame_idx, iterations):
         allow_densify = True if frame_idx == 0 else (frame_idx % 5 == 0)
@@ -634,6 +1051,23 @@ class GaussianSplattingSolver:
                 render_d = self._align_shape(meta_d[0][0][..., 0:1])
                 loss += lambda_depth * l1_loss(render_d * gt_mask, gt_d * gt_mask)
                 if i == iterations - 1: render_d_final = render_d.detach()
+                
+                # ==============================
+                # [新增] 逐点深度约束 - 直接把每个高斯点拉到GT深度上
+                # ==============================
+                # 这比渲染深度loss更强力：直接约束每个点的3D位置
+                per_point_depth_loss = compute_per_point_depth_loss(
+                    self.means, gt_d, gt_mask, viewmat_gt, self.K, self.W, self.H
+                )
+                # 使用较大的权重确保高斯点贴合GT深度
+                lambda_per_point = 1.0 if i < 500 else 0.5  # 前期强约束，后期适当放松
+                loss += lambda_per_point * per_point_depth_loss
+                
+                # [更强力版本] 深度拉扯约束 - 计算目标位置并约束
+                depth_pull_loss = compute_depth_pull_loss(
+                    self.means, gt_d, gt_mask, viewmat_gt, self.K, self.W, self.H, c2w_curr, strength=0.5
+                )
+                loss += depth_pull_loss
 
             if frame_idx > 0 and self.knn_rigid_indices is not None:
                 n_prev = self.means_prev_all.shape[0]
@@ -723,7 +1157,7 @@ class GaussianSplattingSolver:
                 if self.means.grad is not None:
                     self.grad_accum += torch.norm(self.means.grad[:, :2], dim=-1)
                     self.denom += 1.0
-                added = self._densify_and_prune()
+                added = self._densify_and_prune(frame_idx=frame_idx, prune_depth_outliers=True)
                 if added:
                     optimizer = optim.Adam([
                         {'params': [self.means], 'lr': 0.00016},
@@ -732,6 +1166,16 @@ class GaussianSplattingSolver:
                         {'params': [self.radii], 'lr': 0.005},
                         {'params': [self.opacities], 'lr': 0.05}
                     ], lr=0.001)
+            
+            # ==============================
+            # [新增] 定期强制深度对齐
+            # 在训练前期强行把高斯点拉到GT深度上
+            # ==============================
+            if i > 0 and i < 1500 and i % 200 == 0:
+                # 前期更激进，后期放松
+                snap_ratio = 0.5 if i < 500 else (0.3 if i < 1000 else 0.1)
+                with torch.no_grad():
+                    self._snap_points_to_depth(frame_idx, snap_ratio=snap_ratio)
 
         rgb_np = (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
         
@@ -767,7 +1211,7 @@ class GaussianSplattingSolver:
 
             rgb_np, depth_np = self.train_frame(t, iters)
             
-            self.save_params(t)
+            self.save_params(t) # 这行该放哪？暂时未定
             
             img_pil = Image.fromarray(rgb_np)
             depth_pil = Image.fromarray(depth_np)
@@ -780,6 +1224,8 @@ class GaussianSplattingSolver:
 
             img_pil.save(f"{self.dir_images}/frame_{t:03d}.png")
             depth_pil.save(f"{self.dir_depths}/depth_{t:03d}.png")
+
+            self.render_freewheel_video(t, video_length=60, scale_factor=0.8)
             
         frames[0].save(f"{self.output_dir}/result_rgb.gif", save_all=True, append_images=frames[1:], duration=40, loop=0)
         depth_frames[0].save(f"{self.output_dir}/result_depth.gif", save_all=True, append_images=depth_frames[1:], duration=40, loop=0)
