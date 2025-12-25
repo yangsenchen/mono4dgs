@@ -11,7 +11,7 @@ from torch import optim
 from tqdm import tqdm
 import cv2 
 from gsplat import rasterization
-from torchvision.utils import save_image # 用于保存Debug图片
+from torchvision.utils import save_image
 import trimesh
 import torchvision.transforms as T
 from diffusers import (
@@ -104,47 +104,45 @@ def get_orbit_camera(c2w, angle_x, angle_y, center=None, device='cuda'):
     if center is None:
         center = torch.zeros(3, device=device)
     
-    # 1. Get current position and radius relative to the center
+    # 1. 计算当前位置和半径
     pos_curr = c2w[:3, 3]
     vec = pos_curr - center
-    radius = torch.norm(vec) + 1e-7 # Prevent division by zero
+    radius = torch.norm(vec) + 1e-7
     
     x, y, z = vec[0], vec[1], vec[2]
     
-    # 2. Convert to Spherical Coordinates (Y-up convention)
-    # Clamp input to acos to range [-1, 1] to prevent NaNs
+    # 2. 转球坐标 (保持不变)
     cos_theta = torch.clamp(y / radius, -1.0 + 1e-6, 1.0 - 1e-6)
-    theta = torch.acos(cos_theta)       # Inclination (0 to PI)
-    phi = torch.atan2(z, x)             # Azimuth
+    theta = torch.acos(cos_theta)
+    phi = torch.atan2(z, x)
     
-    # 3. Apply Angle Deltas
-    # angle_y is elevation change. If angle_y > 0 (move up), theta should decrease.
+    # 3. 应用旋转 (保持不变)
     theta_new = theta - torch.deg2rad(torch.tensor(angle_y, device=device))
-    theta_new = torch.clamp(theta_new, 0.1, 3.0) # Prevent Gimbal Lock (poles)
-    
+    theta_new = torch.clamp(theta_new, 0.1, 3.0)
     phi_new = phi - torch.deg2rad(torch.tensor(angle_x, device=device))
     
-    # 4. Convert back to Cartesian
+    # 4. 转回笛卡尔坐标
     y_new = radius * torch.cos(theta_new)
-    h     = radius * torch.sin(theta_new) # Horizontal radius
+    h     = radius * torch.sin(theta_new)
     x_new = h * torch.cos(phi_new)
     z_new = h * torch.sin(phi_new)
     
     pos_new = torch.stack([x_new, y_new, z_new]) + center
     
-    # 5. Robust LookAt Matrix Construction
-    # Forward (Z-axis): Points from Object TO Camera (OpenGL convention)
-    z_axis = F.normalize(center - pos_new, dim=0)
+    # 5. LookAt 矩阵构建 (关键修复)
     
-    # Global Up Vector
+    # 【Z轴修复】：改回指向物体 (解决白屏问题)
+    # Forward (Z-axis): Points TO Object (OpenCV convention)
+    z_axis = F.normalize(center - pos_new, dim=0) 
+    
+    # Global Up
     world_up = torch.tensor([0.0, 1.0, 0.0], device=device)
     
-    # 【关键修改】：这里加一个负号，或者交换叉乘顺序！
-    # 原来是: x_axis = F.normalize(torch.cross(world_up, z_axis), dim=0)
-    # 因为 Z 轴反了导致 X 轴也反了，所以我们要手动把 X 轴掰回来：
-    x_axis = -F.normalize(torch.cross(world_up, z_axis), dim=0) 
+    # 【X轴修复】：强制取反 (解决镜像问题)
+    # 原本是 cross(world_up, z_axis)，现在加个负号
+    x_axis = -F.normalize(torch.cross(world_up, z_axis), dim=0)
     
-    # Y 轴保持逻辑不变 (由 Z 和 X 决定)
+    # Y轴跟随变化
     y_axis = F.normalize(torch.cross(z_axis, x_axis), dim=0)
     
     new_c2w = torch.eye(4, device=device)
@@ -154,7 +152,7 @@ def get_orbit_camera(c2w, angle_x, angle_y, center=None, device='cuda'):
     new_c2w[:3, 3] = pos_new
     
     return new_c2w
-
+    
 def ssim(img1, img2, window_size=11, size_average=True):
     def gaussian(window_size, sigma):
         gauss = torch.Tensor([math.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -267,6 +265,10 @@ class Zero123Guide(nn.Module):
         ref_img_224 = F.interpolate(ref_image_tensor, (224, 224), mode='bilinear', align_corners=False)
         ref_img_norm_clip = T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))(ref_img_224)
         self.ref_embeddings = self.image_encoder(ref_img_norm_clip).image_embeds.to(dtype=self.dtype)
+        
+        # [新增] 生成 Unconditional (Null) Embeddings 用于 CFG
+        # 通常是用全零图或者黑图，这里直接构造全零 embedding 是最稳的做法
+        self.null_embeddings = torch.zeros_like(self.ref_embeddings)
 
         # VAE Branch
         ref_img_256 = F.interpolate(ref_image_tensor, (256, 256), mode='bilinear', align_corners=False)
@@ -297,14 +299,20 @@ class Zero123Guide(nn.Module):
         d_azimuth = (d_azimuth + 180) % 360 - 180
         return d_elevation.unsqueeze(0), d_azimuth.unsqueeze(0), d_radius.unsqueeze(0)
 
-    def sds_loss(self, pred_rgb, relative_pose):
+
+    def sds_loss(self, pred_rgb, relative_pose, guidance_scale=3.0):
+        """
+        guidance_scale: 通常设为 3.0 到 5.0，这决定了生成纹理的锐利程度。
+        """
         pred_256 = F.interpolate(pred_rgb, (256, 256), mode='bilinear', align_corners=False)
         vae_input = (pred_256 - 0.5) * 2
         vae_input = vae_input.to(dtype=self.dtype) 
         
+        # 1. Encode Latents
         latents = self.vae.encode(vae_input).latent_dist.sample()
         latents = latents * 0.18215
         
+        # 2. Add Noise
         noise = torch.randn_like(latents)
         t = torch.randint(
             int(self.min_step * self.scheduler.config.num_train_timesteps), 
@@ -313,12 +321,26 @@ class Zero123Guide(nn.Module):
         )
         noisy_latents = self.scheduler.add_noise(latents, noise, t)
         
-        latent_model_input = torch.cat([noisy_latents, self.ref_latents], dim=1)
+        # 3. Prepare Batch for CFG (Cond + Uncond)
+        # [Batch=2]: [Cond, Uncond]
+        latent_model_input = torch.cat([noisy_latents] * 2)
+        # Cond 使用 ref_latents, Uncond 使用 ref_latents (或者 zeros, 但 Zero123XL 主要是靠 CLIP embedding 做 cond)
+        # Zero123 的 latent condition 通常保持一致
+        latent_model_input = torch.cat([latent_model_input, torch.cat([self.ref_latents] * 2)], dim=1)
         
         d_el, d_az, d_r = relative_pose
         camera_embeddings = self.get_cam_embeddings(d_el, d_az, d_r)
         
-        encoder_hidden_states = self.ref_embeddings.unsqueeze(1)
+        # 构建 Cond 和 Uncond 的 Embedding
+        # Cond: 真实的参考图 embedding
+        # Uncond: 全零 embedding
+        encoder_hidden_states = torch.cat([self.ref_embeddings, self.null_embeddings], dim=0).unsqueeze(1)
+        
+        # Camera Pose Cond 也要复制一遍 (Uncond 通常也给同样的 pose，或者给 null pose，Zero123 主要是靠 Image Embedding)
+        # 这里给同样的 Pose 是常见做法
+        camera_embeddings = torch.cat([camera_embeddings] * 2, dim=0)
+
+        # 4. Predict Noise
         noise_pred = self.unet(
             latent_model_input, 
             t, 
@@ -326,8 +348,13 @@ class Zero123Guide(nn.Module):
             class_labels=camera_embeddings
         ).sample
 
+        # 5. Apply CFG
+        noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+        # 6. Compute SDS Gradients
         w = 1 - (t / self.scheduler.config.num_train_timesteps)
-        grad = w[:, None, None, None] * (noise_pred - noise)
+        grad = w * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
         
         latents_float = latents.float()
@@ -341,7 +368,7 @@ class Zero123Guide(nn.Module):
 # 3. Gaussian Splatting Solver
 # ==========================================
 
-class GSSolver:
+class GaussianSplattingSolver:
     def __init__(self, data_path: str, sam2_video_path: str, output_dir: str, focal_ratio: float = 0.8, use_sds: bool = True):
         self.device = torch.device("cuda:0")
         self.output_dir = output_dir
@@ -360,23 +387,17 @@ class GSSolver:
         print(f"Loading data from {data_path}...")
         data = np.load(data_path)
 
-        if 'images' in data: self.images = torch.from_numpy(data['images'].astype(np.float32) / 255.0).to(self.device)
-        else: self.images = torch.from_numpy(data['image'].astype(np.float32) / 255.0).to(self.device)
+        self.images = torch.from_numpy(data['images'].astype(np.float32) / 255.0).to(self.device)
         
-        depth_key = next((k for k in ['d', 'depth', 'depths'] if k in data), None)
-        self.depths = torch.from_numpy(data[depth_key].astype(np.float32)).to(self.device)
+        self.depths = torch.from_numpy(data['depths'].astype(np.float32)).to(self.device)
         
-        pose_key = 'cam_c2w' if 'cam_c2w' in data else 'c2w'
-        self.c2ws = torch.from_numpy(data[pose_key].astype(np.float32)).to(self.device)
+        self.c2ws = torch.from_numpy(data['cam_c2w'].astype(np.float32)).to(self.device)
         self.c2ws[..., 0:3, 1:3] *= -1 # OpenCV -> OpenGL
         
         self.num_frames, self.H, self.W, _ = self.images.shape
         print(f"Data Loaded: {self.num_frames} frames, {self.W}x{self.H}")
 
-        if 'K' in data:
-            self.K = torch.from_numpy(data['K']).to(self.device)
-            self.focal = self.K[0, 0].item()
-        elif 'intrinsic' in data:
+        if 'intrinsic' in data:
             self.K = torch.from_numpy(data['intrinsic']).to(self.device)
             self.focal = self.K[0, 0].item()
         else:
@@ -387,19 +408,28 @@ class GSSolver:
         self.gt_masks, self.core_masks = self._load_masks_from_video(sam2_video_path)
         if self.gt_masks is None: exit()
 
+        # means_prev_all 和 means_prev_2这两个变量记录了高斯球（Gaussians）在前几帧的位置坐标（XYZ）。
+        # means_prev_all (上一帧位置): 存储 $t-1$ 帧时所有高斯球的中心点坐标。
+        # eans_prev_2 (前两帧位置): 存储 $t-2$ 帧时所有高斯球的中心点坐标。
         self.means_prev_all = None
         self.means_prev_2 = None
+
         self.knn_rigid_indices = None
         self.knn_rigid_weights = None
 
         if self.use_sds:
             print("[SDS] Initializing Zero123 Guidance Model...")
             self.guidance = Zero123Guide(self.device)
-            # [修正] 移除这里的 prepare_condition，改到 train_frame 中动态设置
 
         self._init_spheres()
 
     def _load_masks_from_video(self, video_path):
+        # gt_mask (Ground Truth Mask): 
+        # 来源： 直接从 SAM2 视频分割结果中提取，表示算法认为的物体完整轮廓。
+        # 特征： 边界比较贴近物体边缘，包含了一些可能存在不确定性的边缘区域。
+        # core_mask (Core Mask):
+        # 来源： 对 gt_mask 进行 cv2.erode (腐蚀操作) 得到的。
+        # 特征： 比 gt_mask 整整“瘦”了一圈（代码里用了 15x15 的卷积核）。它只保留了物体最中心的、绝对确定属于物体的部分。
         print(f"Loading masks from video: {video_path}")
         if not os.path.exists(video_path):
             print(f"Error: Video file not found: {video_path}")
@@ -440,7 +470,7 @@ class GSSolver:
         print("Initializing Gaussian Ellipsoids (Anisotropic)...")
         idx = 0
         depth = self.depths[idx]
-        mask = self.gt_masks[idx, ..., 0] > 0.5
+        mask = self.gt_masks[idx, ..., 0] > 0.5 # 获取第一帧的掩码。我们只希望在物体本身所在的位置生成高斯球，而不希望在背景（天空、地面）生成。
         
         ys, xs = torch.meshgrid(torch.arange(self.H), torch.arange(self.W), indexing='ij')
         ys, xs = ys.to(self.device), xs.to(self.device)
@@ -534,7 +564,7 @@ class GSSolver:
         gt_img_raw = self.images[frame_idx]
         gt_img = gt_img_raw * gt_mask + (1.0 - gt_mask) * 1.0 
         
-        # [核心修复]：Zero123 Condition 准备
+        # Zero123 Condition 准备
         if self.use_sds:
             # 1. 转为 [C, H, W]
             ref_img_chw = gt_img_raw.permute(2, 0, 1) 
@@ -559,7 +589,7 @@ class GSSolver:
 
         lambda_depth = 0.2
         lambda_sds_base = 0.01
-        sds_warmup = 1000
+        sds_warmup = 1800
         max_angle_deg = 45.0
         sds_interval = 10
         
@@ -664,7 +694,7 @@ class GSSolver:
                     
                     dynamic_weight = lambda_sds_base * (0.5 + 1.5 * (total_angle_diff / max_angle_deg))
                     rel_pose = self.guidance.compute_relative_pose(c2w_novel)
-                    loss_sds_val = self.guidance.sds_loss(pred_img_centered, rel_pose)
+                    loss_sds_val = self.guidance.sds_loss(pred_img_centered, rel_pose, guidance_scale=3.0)
                     loss += dynamic_weight * loss_sds_val
                     
                     opacity_novel = rgba_novel[..., 3]
@@ -719,7 +749,7 @@ class GSSolver:
         frames = []
         depth_frames = []
         
-        print(f"=== Starting Ellipsoidal Reconstruction ===")
+        print(f"=== Starting Reconstruction ===")
         print(f"=== Saving to: {self.output_dir} ===")
         
         for t in range(self.num_frames):
@@ -759,9 +789,11 @@ class GSSolver:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gaussian Splatting Solver")
     
-    parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/learn-genmojo/data/car-turn/MegaSAM_Outputs/car-turn_sgd_cvd_hr.npz")
-    parser.add_argument("--video_path", type=str, default="sam2_.mp4")
-    parser.add_argument("--exp_name", type=str, default="default_exp")
+    # parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/learn-genmojo/data/car-turn/MegaSAM_Outputs/car-turn_sgd_cvd_hr.npz")
+    parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/mega-sam/outputs_cvd/breakdance-flare_sgd_cvd_hr.npz")
+    # parser.add_argument("--video_path", type=str, default="/root/autodl-tmp/exp/input/car-turn-sam2.mp4")
+    parser.add_argument("--video_path", type=str, default="/root/autodl-tmp/exp/input/breakdance-flare-sam2.mp4")
+    parser.add_argument("--exp_name", type=str, default="breakdance-flare")
     parser.add_argument("--output_root", type=str, default="results")
     parser.add_argument("--focal_ratio", type=float, default=0.8)
     parser.add_argument("--use_sds", action="store_true")
@@ -772,7 +804,7 @@ if __name__ == "__main__":
     folder_name = f"{current_time}_{args.exp_name}"
     full_output_dir = os.path.join(args.output_root, folder_name)
 
-    solver = GSSolver(
+    solver = GaussianSplattingSolver(
         data_path=args.data_path, 
         sam2_video_path=args.video_path, 
         output_dir=full_output_dir,
