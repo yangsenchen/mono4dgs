@@ -128,6 +128,317 @@ def compute_per_point_depth_loss(means, gt_depth, gt_mask, viewmat, K, W, H, mar
     return loss
 
 
+def depth_to_normal(depth, K, mask=None):
+    """
+    从深度图计算表面法线（相机坐标系）
+    
+    使用有限差分计算深度梯度，然后推导法线方向
+    
+    Args:
+        depth: [H, W] 或 [H, W, 1] 深度图
+        K: [3, 3] 相机内参矩阵
+        mask: [H, W] 或 [H, W, 1] 可选的mask，只计算mask内的法线
+    
+    Returns:
+        normals: [H, W, 3] 法线图（相机坐标系，指向相机）
+    """
+    if depth.dim() == 3:
+        depth = depth.squeeze(-1)
+    if mask is not None and mask.dim() == 3:
+        mask = mask.squeeze(-1)
+    
+    H, W = depth.shape
+    device = depth.device
+    
+    # 提取相机内参
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+    
+    # 创建像素坐标网格
+    v, u = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    u = u.float()
+    v = v.float()
+    
+    # 反投影到3D点（相机坐标系）
+    z = depth
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    
+    # 使用Sobel算子计算梯度（更稳定）
+    # 或者使用简单的有限差分
+    # 这里使用中心差分，更准确
+    
+    # 计算 x, y, z 方向的偏导数
+    # dz/du, dz/dv
+    dz_du = torch.zeros_like(z)
+    dz_dv = torch.zeros_like(z)
+    dx_du = torch.zeros_like(z)
+    dx_dv = torch.zeros_like(z)
+    dy_du = torch.zeros_like(z)
+    dy_dv = torch.zeros_like(z)
+    
+    # 中心差分 (避免边界问题)
+    dz_du[:, 1:-1] = (z[:, 2:] - z[:, :-2]) / 2.0
+    dz_dv[1:-1, :] = (z[2:, :] - z[:-2, :]) / 2.0
+    
+    dx_du[:, 1:-1] = (x[:, 2:] - x[:, :-2]) / 2.0
+    dx_dv[1:-1, :] = (x[2:, :] - x[:-2, :]) / 2.0
+    
+    dy_du[:, 1:-1] = (y[:, 2:] - y[:, :-2]) / 2.0
+    dy_dv[1:-1, :] = (y[2:, :] - y[:-2, :]) / 2.0
+    
+    # 边界使用前向/后向差分
+    dz_du[:, 0] = z[:, 1] - z[:, 0]
+    dz_du[:, -1] = z[:, -1] - z[:, -2]
+    dz_dv[0, :] = z[1, :] - z[0, :]
+    dz_dv[-1, :] = z[-1, :] - z[-2, :]
+    
+    dx_du[:, 0] = x[:, 1] - x[:, 0]
+    dx_du[:, -1] = x[:, -1] - x[:, -2]
+    dx_dv[0, :] = x[1, :] - x[0, :]
+    dx_dv[-1, :] = x[-1, :] - x[-2, :]
+    
+    dy_du[:, 0] = y[:, 1] - y[:, 0]
+    dy_du[:, -1] = y[:, -1] - y[:, -2]
+    dy_dv[0, :] = y[1, :] - y[0, :]
+    dy_dv[-1, :] = y[-1, :] - y[-2, :]
+    
+    # 构建切向量
+    # 沿u方向的切向量: (dx/du, dy/du, dz/du)
+    # 沿v方向的切向量: (dx/dv, dy/dv, dz/dv)
+    tu = torch.stack([dx_du, dy_du, dz_du], dim=-1)  # [H, W, 3]
+    tv = torch.stack([dx_dv, dy_dv, dz_dv], dim=-1)  # [H, W, 3]
+    
+    # 法线 = tu × tv (叉积)
+    # 注意：叉积的顺序决定法线方向
+    # tu 是沿 u 方向的切向量，tv 是沿 v 方向的切向量
+    # tu × tv 给出指向观察者（相机）方向的法线
+    normals = torch.cross(tu, tv, dim=-1)  # [H, W, 3]
+    
+    # 归一化
+    norm_length = torch.norm(normals, dim=-1, keepdim=True) + 1e-8
+    normals = normals / norm_length
+    
+    # 确保法线指向相机外（即从表面指向空间）
+    # 在相机坐标系中，相机在原点看向+z，物体在z>0位置
+    # 所以面向相机的表面法线应该z分量<0（指向-z，即指向相机）
+    # 但我们希望法线指向"表面外部"，对于面向相机的表面就是指向相机
+    # 如果z分量为正（法线指向物体内部），则翻转
+    flip_mask = (normals[..., 2:3] > 0).float()
+    normals = normals * (1 - 2 * flip_mask)
+    
+    # 对无效区域（深度为0或mask外）设置为零法线
+    invalid = (depth < 0.01) | (depth > 100.0)
+    if mask is not None:
+        invalid = invalid | (mask < 0.5)
+    normals[invalid] = 0
+    
+    return normals
+
+
+def normal_to_quaternion(normal, up_hint=None):
+    """
+    将法线向量转换为四元数（让高斯椭球的最短轴对齐法线）
+    
+    高斯椭球应该"躺"在表面上，即：
+    - 椭球的z轴（最短轴）应该与表面法线平行
+    - 椭球的x,y轴（较长轴）应该在表面平面内
+    
+    Args:
+        normal: [N, 3] 法线向量（应该已经归一化，指向表面外部）
+        up_hint: [3] 可选的上方向参考，用于确定绕法线的旋转
+    
+    Returns:
+        quats: [N, 4] 四元数 (w, x, y, z)
+    """
+    device = normal.device
+    N = normal.shape[0]
+    
+    if up_hint is None:
+        up_hint = torch.tensor([0.0, 1.0, 0.0], device=device)
+    
+    # 归一化法线
+    normal = F.normalize(normal, dim=-1)
+    
+    # 参考方向：(0, 0, 1) 是默认四元数 (1,0,0,0) 对应的z轴方向
+    # 我们要找一个旋转，把 (0, 0, 1) 旋转到 normal
+    # 这样高斯椭球的z轴就会与法线对齐
+    ref = torch.tensor([0.0, 0.0, 1.0], device=device).expand(N, -1)
+    
+    # 使用 Rodrigues 旋转公式
+    # 旋转轴 = ref × normal
+    # 旋转角 = arccos(ref · normal)
+    
+    dot = (ref * normal).sum(dim=-1, keepdim=True)  # [N, 1]
+    cross = torch.cross(ref, normal, dim=-1)  # [N, 3]
+    
+    # 处理平行情况（ref 和 normal 已经对齐）
+    cross_norm = torch.norm(cross, dim=-1, keepdim=True) + 1e-8
+    axis = cross / cross_norm  # 旋转轴
+    
+    # 处理反平行情况 (dot ≈ -1，需要旋转180度)
+    anti_parallel = dot.squeeze(-1) < -0.999
+    if anti_parallel.any():
+        # 选择任意垂直轴作为旋转轴
+        axis[anti_parallel] = torch.tensor([1.0, 0.0, 0.0], device=device)
+    
+    # 处理几乎平行情况 (dot ≈ 1，不需要旋转)
+    parallel = dot.squeeze(-1) > 0.999
+    
+    # 计算旋转角
+    angle = torch.acos(torch.clamp(dot, -1.0, 1.0))  # [N, 1]
+    
+    # 四元数: q = (cos(θ/2), sin(θ/2) * axis)
+    half_angle = angle / 2.0
+    w = torch.cos(half_angle)  # [N, 1]
+    xyz = torch.sin(half_angle) * axis  # [N, 3]
+    
+    quats = torch.cat([w, xyz], dim=-1)  # [N, 4]
+    
+    # 对于几乎平行的情况，使用单位四元数
+    if parallel.any():
+        quats[parallel] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
+    
+    # 归一化四元数
+    quats = F.normalize(quats, dim=-1)
+    
+    return quats
+
+
+def quaternion_to_axes(quats):
+    """
+    从四元数提取三个局部坐标轴
+    
+    Args:
+        quats: [N, 4] 四元数 (w, x, y, z)
+    
+    Returns:
+        axes: [N, 3, 3] 旋转矩阵，每行是一个轴 (x_axis, y_axis, z_axis)
+    """
+    quats = F.normalize(quats, dim=-1)
+    w, x, y, z = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
+    
+    # 旋转矩阵的列向量
+    # 第一列 (x轴)
+    r00 = 1 - 2*(y*y + z*z)
+    r10 = 2*(x*y + w*z)
+    r20 = 2*(x*z - w*y)
+    
+    # 第二列 (y轴)
+    r01 = 2*(x*y - w*z)
+    r11 = 1 - 2*(x*x + z*z)
+    r21 = 2*(y*z + w*x)
+    
+    # 第三列 (z轴) - 这是高斯椭球的最短轴方向
+    r02 = 2*(x*z + w*y)
+    r12 = 2*(y*z - w*x)
+    r22 = 1 - 2*(x*x + y*y)
+    
+    # 组装旋转矩阵
+    R = torch.stack([
+        torch.stack([r00, r01, r02], dim=-1),
+        torch.stack([r10, r11, r12], dim=-1),
+        torch.stack([r20, r21, r22], dim=-1)
+    ], dim=1)  # [N, 3, 3]
+    
+    return R
+
+
+def compute_normal_alignment_loss(means, quats, normal_map, mask, viewmat, K, W, H, c2w):
+    """
+    法线对齐约束：让高斯点的最短轴方向与表面法线对齐
+    
+    这是非常强力的约束，确保高斯椭球"贴"在物体表面上
+    
+    Args:
+        means: [N, 3] 高斯点3D位置（世界坐标系）
+        quats: [N, 4] 高斯点四元数
+        normal_map: [H, W, 3] 法线图（相机坐标系）
+        mask: [H, W, 1] 物体mask
+        viewmat: [4, 4] 相机view矩阵
+        K: [3, 3] 相机内参
+        W, H: 图像尺寸
+        c2w: [4, 4] 相机到世界变换矩阵
+    
+    Returns:
+        loss: 标量损失值
+    """
+    N = means.shape[0]
+    device = means.device
+    
+    # Step 1: 将高斯点投影到图像平面
+    means_homo = torch.cat([means, torch.ones(N, 1, device=device)], dim=-1)
+    means_cam = (viewmat @ means_homo.T).T[:, :3]
+    z_cam = means_cam[:, 2]
+    
+    means_2d = means_cam @ K.T
+    u = means_2d[:, 0] / (means_2d[:, 2] + 1e-8)
+    v = means_2d[:, 1] / (means_2d[:, 2] + 1e-8)
+    
+    # 过滤有效点
+    valid_depth = z_cam > 0.01
+    valid_u = (u >= 0) & (u < W - 1)
+    valid_v = (v >= 0) & (v < H - 1)
+    valid_proj = valid_depth & valid_u & valid_v
+    
+    if valid_proj.sum() < 10:
+        return torch.tensor(0.0, device=device)
+    
+    # Step 2: 采样法线
+    u_norm = (2.0 * u / (W - 1) - 1.0)
+    v_norm = (2.0 * v / (H - 1) - 1.0)
+    grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
+    
+    # normal_map: [H, W, 3] -> [1, 3, H, W]
+    normal_4d = normal_map.permute(2, 0, 1).unsqueeze(0)
+    mask_4d = mask.squeeze(-1).unsqueeze(0).unsqueeze(0)
+    
+    # 采样每个点对应的法线和mask
+    sampled_normal = F.grid_sample(normal_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    sampled_normal = sampled_normal.squeeze().T  # [N, 3]
+    sampled_mask = F.grid_sample(mask_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+    
+    # 归一化采样的法线
+    sampled_normal = F.normalize(sampled_normal, dim=-1)
+    
+    # Step 3: 过滤有效点
+    valid_mask = valid_proj & (sampled_mask > 0.5)
+    normal_valid = torch.norm(sampled_normal, dim=-1) > 0.5
+    valid_mask = valid_mask & normal_valid
+    
+    if valid_mask.sum() < 10:
+        return torch.tensor(0.0, device=device)
+    
+    # Step 4: 从四元数提取高斯椭球的最短轴（z轴）
+    # 这个轴应该与表面法线对齐
+    R = quaternion_to_axes(quats)  # [N, 3, 3]
+    z_axis_local = R[:, :, 2]  # [N, 3] 高斯椭球的z轴（最短轴方向）
+    
+    # Step 5: 将法线从相机坐标系转换到世界坐标系
+    # 法线变换需要使用 (R^T)^(-1) = R^T 的转置，但对于正交矩阵，R^(-T) = R
+    # 所以法线变换用 c2w 的旋转部分
+    R_c2w = c2w[:3, :3]
+    sampled_normal_world = (R_c2w @ sampled_normal[valid_mask].T).T  # [M, 3]
+    sampled_normal_world = F.normalize(sampled_normal_world, dim=-1)
+    
+    # Step 6: 计算对齐loss
+    # 我们希望 z_axis_local 与 sampled_normal_world 平行（可以同向或反向）
+    # 使用 1 - |dot| 作为loss，这样同向和反向都是0 loss
+    z_axis_valid = z_axis_local[valid_mask]
+    dot_product = (z_axis_valid * sampled_normal_world).sum(dim=-1)  # [M]
+    
+    # 使用 1 - dot^2 可以让同向和反向都接近0
+    # 或者使用 1 - |dot| 但要小心梯度
+    alignment_loss = (1.0 - dot_product.abs()).mean()
+    
+    # 额外的惩罚：如果点积接近0（垂直），惩罚更大
+    perpendicular_penalty = torch.exp(-4.0 * dot_product.abs()).mean() * 0.1
+    
+    return alignment_loss + perpendicular_penalty
+
+
 def compute_depth_pull_loss(means, gt_depth, gt_mask, viewmat, K, W, H, c2w, strength=1.0):
     """
     深度拉扯约束：直接计算每个高斯点"应该在的正确位置"，然后约束点向那个位置移动
@@ -657,7 +968,7 @@ class GaussianSplattingSolver:
         return tensor
 
     def _init_spheres(self):
-        print("Initializing Gaussian Ellipsoids (Anisotropic)...")
+        print("Initializing Gaussian Ellipsoids (Anisotropic) with Normal-aligned Orientation...")
         idx = 0
         depth = self.depths[idx]
         mask = self.gt_masks[idx, ..., 0] > 0.5 # 获取第一帧的掩码。我们只希望在物体本身所在的位置生成高斯球，而不希望在背景（天空、地面）生成。
@@ -676,8 +987,58 @@ class GaussianSplattingSolver:
         self.means = (c2w[:3, :3] @ xyz_cam.T).T + c2w[:3, 3]
         
         N = self.means.shape[0]
-        self.radii = torch.ones((N, 3), device=self.device) * -5.0 
-        self.quats = torch.rand((N, 4), device=self.device); self.quats[:, 0] = 1.0
+        
+        # 计算像素级大小的 radii
+        # 一个像素在3D空间的大小 ≈ depth / focal
+        # 我们希望高斯点大约是 1-2 个像素大小
+        avg_depth = d.mean().item()
+        pixel_size_3d = avg_depth / self.focal  # 一个像素对应的3D尺寸
+        target_radius = pixel_size_3d * 1.5  # 目标：约1.5个像素
+        target_radii = math.log(target_radius)
+        
+        print(f"[*] Avg depth: {avg_depth:.3f}, Pixel size 3D: {pixel_size_3d:.6f}")
+        print(f"[*] Target radius: {target_radius:.6f}, Target radii (log): {target_radii:.3f}")
+        
+        # 初始化 radii：像素级大小，扁平形状
+        self.radii = torch.ones((N, 3), device=self.device) * target_radii  # x, y 轴
+        self.radii[:, 2] = target_radii - 1.5  # z 轴更薄
+        
+        # 保存像素级 radii 上限供训练时使用
+        self.pixel_radii_max = target_radii + 0.5  # 允许略大于1.5像素
+        self.pixel_radii_min = target_radii - 3.0  # 最小约0.05像素 
+        
+        # ==============================
+        # [核心改进] 用深度图法线初始化四元数
+        # 这确保高斯椭球从一开始就"贴"在物体表面
+        # ==============================
+        print("[*] Computing surface normals from depth map...")
+        
+        # 计算完整的法线图（相机坐标系）
+        normal_map_cam = depth_to_normal(depth, self.K, mask.float())  # [H, W, 3]
+        
+        # 提取每个有效点的法线
+        # valid 是一个 [H, W] 的布尔mask
+        normals_cam = normal_map_cam[valid]  # [N, 3] 相机坐标系法线
+        
+        # 将法线从相机坐标系转换到世界坐标系
+        R_c2w = c2w[:3, :3]
+        normals_world = (R_c2w @ normals_cam.T).T  # [N, 3] 世界坐标系法线
+        
+        # 归一化（处理可能的零法线）
+        normal_norms = torch.norm(normals_world, dim=-1, keepdim=True)
+        valid_normal = normal_norms.squeeze() > 0.1
+        normals_world = F.normalize(normals_world, dim=-1)
+        
+        # 将法线转换为四元数
+        self.quats = normal_to_quaternion(normals_world)
+        
+        # 对于法线无效的点，使用默认四元数（单位四元数）
+        invalid_normal = ~valid_normal
+        if invalid_normal.sum() > 0:
+            self.quats[invalid_normal, 0] = 1.0
+            self.quats[invalid_normal, 1:] = 0.0
+        
+        print(f"[*] Initialized {N} quaternions from surface normals ({valid_normal.sum().item()} valid normals)")
         
         rgb_vals = self.images[idx][valid]
         self.rgbs = torch.log(torch.clamp(rgb_vals, 0.01, 0.99) / (1 - rgb_vals))
@@ -691,7 +1052,7 @@ class GaussianSplattingSolver:
         
         self.grad_accum = torch.zeros(N, device=self.device)
         self.denom = torch.zeros(N, device=self.device)
-        print(f"[*] Initialized {N} Gaussians (Ellipsoids).")
+        print(f"[*] Initialized {N} Gaussians (Ellipsoids) with Normal-aligned Orientation.")
 
     def _compute_knn(self, points, k=20):
         indices = []
@@ -714,7 +1075,7 @@ class GaussianSplattingSolver:
         with torch.no_grad():
             grads = self.grad_accum / self.denom
             grads[self.denom == 0] = 0.0
-            to_clone = grads >= 0.0004
+            to_clone = grads >= 0.0002  # 降低阈值，增加点密度以保留细节
             
             if to_clone.sum() > 0:
                 self.means = torch.cat([self.means, self.means[to_clone]]).detach().requires_grad_(True)
@@ -796,16 +1157,196 @@ class GaussianSplattingSolver:
         
         return is_outlier
     
-    def _snap_points_to_depth(self, frame_idx, snap_ratio=0.3):
+    def _snap_points_to_depth_hard(self, frame_idx, remove_outliers=True, depth_tolerance=0.05):
         """
-        [强力深度对齐] 将高斯点强制拉到GT深度上
+        [硬约束深度对齐] 强制将所有高斯点完全对齐到GT深度上
         
-        这个函数会修改高斯点的位置，使其沿着射线方向移动到正确深度
-        只移动一部分距离（snap_ratio），避免破坏已有的优化结果
+        这个函数会：
+        1. 将所有有效点100%对齐到GT深度（不是部分移动）
+        2. 删除投影到mask外的点（这些点在新视角会漂浮）
+        3. 删除深度严重偏离的点
         
         Args:
             frame_idx: 当前帧索引
-            snap_ratio: 移动多少比例向目标深度 (0.0=不动, 1.0=完全对齐)
+            remove_outliers: 是否删除mask外的点
+            depth_tolerance: 允许的相对深度误差（超过这个会被删除）
+        """
+        N = self.means.shape[0]
+        device = self.device
+        
+        gt_depth = self.depths[frame_idx].unsqueeze(-1)
+        gt_mask = self.gt_masks[frame_idx]
+        c2w = self.c2ws[frame_idx]
+        viewmat = torch.inverse(c2w)
+        
+        # 变换到相机坐标系
+        means_homo = torch.cat([self.means.data, torch.ones(N, 1, device=device)], dim=-1)
+        means_cam = (viewmat @ means_homo.T).T[:, :3]
+        z_cam = means_cam[:, 2]
+        
+        # 投影
+        means_2d = means_cam @ self.K.T
+        u = means_2d[:, 0] / (means_2d[:, 2] + 1e-8)
+        v = means_2d[:, 1] / (means_2d[:, 2] + 1e-8)
+        
+        # 有效性检查
+        valid_depth = z_cam > 0.01
+        valid_u = (u >= 0) & (u < self.W - 1)
+        valid_v = (v >= 0) & (v < self.H - 1)
+        valid_proj = valid_depth & valid_u & valid_v
+        
+        # 采样GT深度
+        u_norm = (2.0 * u / (self.W - 1) - 1.0)
+        v_norm = (2.0 * v / (self.H - 1) - 1.0)
+        grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
+        
+        gt_depth_4d = gt_depth.squeeze(-1).unsqueeze(0).unsqueeze(0)
+        gt_mask_4d = gt_mask.squeeze(-1).unsqueeze(0).unsqueeze(0)
+        
+        sampled_depth = F.grid_sample(gt_depth_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+        sampled_mask = F.grid_sample(gt_mask_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+        
+        # ==============================
+        # Step 1: 100%对齐mask内的点到GT深度
+        # ==============================
+        snap_mask = valid_proj & (sampled_mask > 0.5) & (sampled_depth > 0.01)
+        
+        if snap_mask.sum() > 0:
+            target_z = sampled_depth[snap_mask]
+            current_z = z_cam[snap_mask]
+            
+            # 完全对齐，不做clamp（允许任意缩放）
+            scale_factor = target_z / (current_z + 1e-8)
+            
+            # 计算新的相机坐标系位置（100%对齐）
+            means_cam_snap = means_cam[snap_mask] * scale_factor.unsqueeze(-1)
+            
+            # 转换回世界坐标系
+            means_cam_snap_homo = torch.cat([means_cam_snap, torch.ones(means_cam_snap.shape[0], 1, device=device)], dim=-1)
+            means_world_snap = (c2w @ means_cam_snap_homo.T).T[:, :3]
+            
+            # 更新高斯点位置
+            self.means.data[snap_mask] = means_world_snap
+        
+        # ==============================
+        # Step 2: 删除mask外的点（这些点会在新视角漂浮）
+        # ==============================
+        if remove_outliers:
+            # 识别需要删除的点：
+            # 1. 投影到mask外的点
+            # 2. 投影到图像外的点
+            # 3. 深度为负的点
+            outside_mask = valid_proj & (sampled_mask < 0.3)  # 在mask外
+            invalid_points = (~valid_proj) | outside_mask
+            
+            # 保留有效点
+            keep_mask = ~invalid_points
+            
+            if (~keep_mask).sum() > 0:
+                n_removed = (~keep_mask).sum().item()
+                self.means = self.means[keep_mask].detach().requires_grad_(True)
+                self.radii = self.radii[keep_mask].detach().requires_grad_(True)
+                self.rgbs = self.rgbs[keep_mask].detach().requires_grad_(True)
+                self.quats = self.quats[keep_mask].detach().requires_grad_(True)
+                self.opacities = self.opacities[keep_mask].detach().requires_grad_(True)
+                
+                # 重置梯度累积
+                self.grad_accum = torch.zeros(self.means.shape[0], device=device)
+                self.denom = torch.zeros(self.means.shape[0], device=device)
+                
+                print(f"[Hard Snap] Removed {n_removed} outlier points, {self.means.shape[0]} remaining")
+                return True  # 需要重建optimizer
+        
+        return False  # 不需要重建optimizer
+    
+    def _enforce_normal_alignment(self, frame_idx, strength=0.5):
+        """
+        [每次迭代后调用] 强制高斯点的方向与表面法线对齐
+        这是硬约束：直接修改四元数，不通过loss
+        
+        Args:
+            frame_idx: 当前帧索引
+            strength: 对齐强度 (0=不对齐, 1=完全对齐)
+        """
+        N = self.means.shape[0]
+        device = self.device
+        
+        gt_depth = self.depths[frame_idx].unsqueeze(-1)
+        gt_mask = self.gt_masks[frame_idx]
+        c2w = self.c2ws[frame_idx]
+        viewmat = torch.inverse(c2w)
+        
+        # 计算法线图
+        normal_map = depth_to_normal(gt_depth.squeeze(-1), self.K, gt_mask.squeeze(-1))
+        
+        # 投影高斯点到图像平面
+        means_homo = torch.cat([self.means.data, torch.ones(N, 1, device=device)], dim=-1)
+        means_cam = (viewmat @ means_homo.T).T[:, :3]
+        z_cam = means_cam[:, 2]
+        
+        means_2d = means_cam @ self.K.T
+        u = means_2d[:, 0] / (means_2d[:, 2] + 1e-8)
+        v = means_2d[:, 1] / (means_2d[:, 2] + 1e-8)
+        
+        # 有效性检查
+        valid_depth = z_cam > 0.01
+        valid_u = (u >= 0) & (u < self.W - 1)
+        valid_v = (v >= 0) & (v < self.H - 1)
+        valid_proj = valid_depth & valid_u & valid_v
+        
+        if valid_proj.sum() < 10:
+            return
+        
+        # 采样法线
+        u_norm = (2.0 * u / (self.W - 1) - 1.0)
+        v_norm = (2.0 * v / (self.H - 1) - 1.0)
+        grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
+        
+        normal_4d = normal_map.permute(2, 0, 1).unsqueeze(0)
+        mask_4d = gt_mask.squeeze(-1).unsqueeze(0).unsqueeze(0)
+        
+        sampled_normal = F.grid_sample(normal_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        sampled_normal = sampled_normal.squeeze().T  # [N, 3]
+        sampled_mask = F.grid_sample(mask_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=True).squeeze()
+        
+        # 归一化法线
+        sampled_normal = F.normalize(sampled_normal, dim=-1)
+        
+        # 过滤有效点
+        valid_mask = valid_proj & (sampled_mask > 0.5)
+        normal_valid = torch.norm(sampled_normal, dim=-1) > 0.5
+        valid_mask = valid_mask & normal_valid
+        
+        if valid_mask.sum() < 10:
+            return
+        
+        # 将法线从相机坐标系转换到世界坐标系
+        R_c2w = c2w[:3, :3]
+        normals_world = (R_c2w @ sampled_normal[valid_mask].T).T
+        normals_world = F.normalize(normals_world, dim=-1)
+        
+        # 计算目标四元数
+        target_quats = normal_to_quaternion(normals_world)
+        
+        # 使用SLERP进行平滑过渡，避免突变
+        current_quats = self.quats.data[valid_mask]
+        
+        # 简化版SLERP：线性插值然后归一化
+        # 确保四元数符号一致（选择最短路径）
+        dot = (current_quats * target_quats).sum(dim=-1, keepdim=True)
+        target_quats = torch.where(dot < 0, -target_quats, target_quats)
+        
+        # 线性插值
+        new_quats = (1 - strength) * current_quats + strength * target_quats
+        new_quats = F.normalize(new_quats, dim=-1)
+        
+        # 更新四元数
+        self.quats.data[valid_mask] = new_quats
+
+    def _enforce_depth_constraint(self, frame_idx):
+        """
+        [每次迭代后调用] 强制所有点贴合GT深度
+        这是最严格的约束：直接修改点位置，不通过loss
         """
         N = self.means.shape[0]
         device = self.device
@@ -852,23 +1393,18 @@ class GaussianSplattingSolver:
         target_z = sampled_depth[snap_mask]
         current_z = z_cam[snap_mask]
         
+        # 100%对齐
         scale_factor = target_z / (current_z + 1e-8)
-        scale_factor = torch.clamp(scale_factor, 0.1, 10.0)
-        
-        # 只移动 snap_ratio 的距离
-        interp_scale = 1.0 + snap_ratio * (scale_factor - 1.0)
         
         # 计算新的相机坐标系位置
-        means_cam_snap = means_cam[snap_mask] * interp_scale.unsqueeze(-1)
+        means_cam_snap = means_cam[snap_mask] * scale_factor.unsqueeze(-1)
         
         # 转换回世界坐标系
         means_cam_snap_homo = torch.cat([means_cam_snap, torch.ones(means_cam_snap.shape[0], 1, device=device)], dim=-1)
         means_world_snap = (c2w @ means_cam_snap_homo.T).T[:, :3]
         
-        # 更新高斯点位置
+        # 更新高斯点位置（直接赋值，不通过梯度）
         self.means.data[snap_mask] = means_world_snap
-        
-        print(f"[Snap] Moved {snap_mask.sum().item()} points toward GT depth (ratio={snap_ratio})")
 
     def save_params(self, frame_idx):
         save_path = os.path.join(self.dir_params, f"gaussians_{frame_idx:03d}.pt")
@@ -969,7 +1505,7 @@ class GaussianSplattingSolver:
             {'params': [self.means], 'lr': 0.00016},
             {'params': [self.quats], 'lr': 0.001},
             {'params': [self.rgbs], 'lr': 0.0025},
-            {'params': [self.radii], 'lr': 0.005},
+            {'params': [self.radii], 'lr': 0.001},  # 极低学习率，保持像素级大小
             {'params': [self.opacities], 'lr': 0.05}
         ], lr=0.001)
 
@@ -1068,17 +1604,99 @@ class GaussianSplattingSolver:
                     self.means, gt_d, gt_mask, viewmat_gt, self.K, self.W, self.H, c2w_curr, strength=0.5
                 )
                 loss += depth_pull_loss
+                
+                # ==============================
+                # [新增] 法线对齐约束 - 让高斯椭球方向贴合表面法线
+                # 这是确保高斯点方向正确的核心约束
+                # ==============================
+                # 从深度图计算法线（每帧只计算一次，缓存起来）
+                if not hasattr(self, '_cached_normal_map') or self._cached_frame_idx != frame_idx:
+                    self._cached_normal_map = depth_to_normal(gt_d.squeeze(-1), self.K, gt_mask.squeeze(-1))
+                    self._cached_frame_idx = frame_idx
+                
+                normal_map = self._cached_normal_map
+                
+                # 计算法线对齐loss
+                normal_alignment_loss = compute_normal_alignment_loss(
+                    self.means, self.quats, normal_map, gt_mask, 
+                    viewmat_gt, self.K, self.W, self.H, c2w_curr
+                )
+                
+                # 法线约束权重：前期强约束，后期适当放松
+                # 但始终保持较高权重确保方向正确
+                lambda_normal = 2.0 if i < 500 else 1.0
+                loss += lambda_normal * normal_alignment_loss
+                
+                # ==============================
+                # [新增] 椭球形状约束 - 消除尖刺，保持合理形状
+                # ==============================
+                
+                # 约束1: 保持扁平形状（z轴最薄）
+                radii_z = self.radii[:, 2]  # z轴 radii
+                radii_xy_min = torch.min(self.radii[:, 0], self.radii[:, 1])  # xy轴较小者
+                margin = 1.0  # radii 空间，exp(-1) ≈ 0.37 的缩放差异
+                flatness_violation = F.relu(radii_z - (radii_xy_min - margin))
+                flatness_loss = flatness_violation.mean()
+                
+                # 约束2: 限制长宽比（防止尖刺）
+                # 任意两个轴的比例不能超过 max_aspect_ratio
+                max_aspect_ratio = 3.0  # 最大允许3:1的长宽比（在scale空间是exp(log_ratio)）
+                max_log_ratio = math.log(max_aspect_ratio)  # 约 1.1
+                
+                radii_max = torch.max(self.radii, dim=1)[0]  # 每个点的最大radii
+                radii_min = torch.min(self.radii, dim=1)[0]  # 每个点的最小radii
+                log_ratio = radii_max - radii_min  # 对数空间的比例
+                
+                # 惩罚超过最大比例的情况
+                aspect_violation = F.relu(log_ratio - max_log_ratio)
+                aspect_loss = aspect_violation.mean()
+                
+                # 约束3: 限制radii的绝对范围（像素级大小）
+                # 使用动态计算的像素级边界
+                radii_min_bound = self.pixel_radii_min
+                radii_max_bound = self.pixel_radii_max
+                
+                # 惩罚超出范围的情况（强力惩罚过大的高斯点）
+                too_small = F.relu(radii_min_bound - self.radii)
+                too_large = F.relu(self.radii - radii_max_bound)
+                # 对过大的高斯点使用平方惩罚，更强力
+                range_loss = too_small.mean() + (too_large ** 2).mean() * 10.0
+                
+                # 约束4: 各向同性正则化（轻微惩罚极端各向异性）
+                # 鼓励椭球更接近圆盘形状，而不是细长条
+                radii_std = torch.std(self.radii, dim=1)  # 每个点三个轴的标准差
+                isotropy_loss = radii_std.mean()
+                
+                # 总形状约束（强力约束保持像素级大小）
+                lambda_flatness = 1.0
+                lambda_aspect = 3.0   # 强力限制长宽比
+                lambda_range = 5.0    # 强力限制尺寸范围
+                lambda_isotropy = 0.2
+                
+                shape_loss = (lambda_flatness * flatness_loss + 
+                             lambda_aspect * aspect_loss + 
+                             lambda_range * range_loss +
+                             lambda_isotropy * isotropy_loss)
+                loss += shape_loss
 
+            # KNN Rigid Loss：保持相邻点之间的距离不变
+            # 注意：当点被删除后，需要检查索引有效性
             if frame_idx > 0 and self.knn_rigid_indices is not None:
                 n_prev = self.means_prev_all.shape[0]
-                curr_rigid = self.means[:n_prev]
-                neighbors_curr = curr_rigid[self.knn_rigid_indices]
-                curr_exp = curr_rigid.unsqueeze(1).expand(-1, 20, -1)
-                dist_curr = torch.norm(neighbors_curr - curr_exp, dim=-1)
-                neighbors_prev = self.means_prev_all[self.knn_rigid_indices]
-                prev_exp = self.means_prev_all.unsqueeze(1).expand(-1, 20, -1)
-                dist_prev = torch.norm(neighbors_prev - prev_exp, dim=-1)
-                loss += 10.0 * (self.knn_rigid_weights * torch.abs(dist_curr - dist_prev)).mean()
+                n_curr = self.means.shape[0]
+                # 只有当当前点数>=之前点数时才计算（点可能被删除）
+                if n_curr >= n_prev:
+                    curr_rigid = self.means[:n_prev]
+                    # 检查knn索引是否有效
+                    max_idx = self.knn_rigid_indices.max().item()
+                    if max_idx < n_prev:
+                        neighbors_curr = curr_rigid[self.knn_rigid_indices]
+                        curr_exp = curr_rigid.unsqueeze(1).expand(-1, 20, -1)
+                        dist_curr = torch.norm(neighbors_curr - curr_exp, dim=-1)
+                        neighbors_prev = self.means_prev_all[self.knn_rigid_indices]
+                        prev_exp = self.means_prev_all.unsqueeze(1).expand(-1, 20, -1)
+                        dist_prev = torch.norm(neighbors_prev - prev_exp, dim=-1)
+                        loss += 10.0 * (self.knn_rigid_weights * torch.abs(dist_curr - dist_prev)).mean()
 
 
 
@@ -1153,6 +1771,50 @@ class GaussianSplattingSolver:
             loss.backward()
             optimizer.step()
             
+            # ==============================
+            # [核心硬约束] 每次迭代后强制约束
+            # 1. 深度对齐：高斯点贴合GT深度
+            # 2. 法线对齐：高斯椭球方向正确
+            # 3. 形状约束：消除尖刺，保持合理形状
+            # ==============================
+            with torch.no_grad():
+                self._enforce_depth_constraint(frame_idx)
+                
+                # 法线硬约束：每10次迭代强制对齐一次
+                # strength=0.3 表示每次对齐30%，避免突变但确保收敛
+                if i % 10 == 0:
+                    self._enforce_normal_alignment(frame_idx, strength=0.3)
+                
+                # [硬约束] 强制限制radii范围（像素级大小）
+                self.radii.data.clamp_(min=self.pixel_radii_min, max=self.pixel_radii_max)
+                
+                # [硬约束] 强制限制长宽比
+                # 确保最大轴和最小轴的差距不超过 log(3) ≈ 1.1
+                max_log_ratio = 1.1
+                radii_max, max_indices = self.radii.data.max(dim=1)
+                radii_min, min_indices = self.radii.data.min(dim=1)
+                current_ratio = radii_max - radii_min
+                
+                # 如果比例超标，压缩到允许范围
+                needs_fix = current_ratio > max_log_ratio
+                
+                if needs_fix.any():
+                    # 计算需要调整的量（平分到两端）
+                    excess = current_ratio[needs_fix] - max_log_ratio
+                    adjustment = excess / 2.0
+                    
+                    # 获取需要修复的点的索引
+                    fix_indices = torch.where(needs_fix)[0]
+                    
+                    # 批量调整：使用scatter_add
+                    for j in range(len(fix_indices)):
+                        idx = fix_indices[j].item()
+                        ma = max_indices[idx].item()
+                        mi = min_indices[idx].item()
+                        adj = adjustment[j].item()
+                        self.radii.data[idx, ma] -= adj
+                        self.radii.data[idx, mi] += adj
+            
             if allow_densify and i > 100 and i < iterations - 100 and i % 300 == 0:
                 if self.means.grad is not None:
                     self.grad_accum += torch.norm(self.means.grad[:, :2], dim=-1)
@@ -1163,20 +1825,32 @@ class GaussianSplattingSolver:
                         {'params': [self.means], 'lr': 0.00016},
                         {'params': [self.quats], 'lr': 0.001},
                         {'params': [self.rgbs], 'lr': 0.0025},
-                        {'params': [self.radii], 'lr': 0.005},
+                        {'params': [self.radii], 'lr': 0.001},  # 极低学习率，保持像素级大小
                         {'params': [self.opacities], 'lr': 0.05}
                     ], lr=0.001)
             
             # ==============================
-            # [新增] 定期强制深度对齐
-            # 在训练前期强行把高斯点拉到GT深度上
+            # [定期清理] 删除mask外的漂浮点
             # ==============================
-            if i > 0 and i < 1500 and i % 200 == 0:
-                # 前期更激进，后期放松
-                snap_ratio = 0.5 if i < 500 else (0.3 if i < 1000 else 0.1)
+            if i > 0 and i % 500 == 0:
                 with torch.no_grad():
-                    self._snap_points_to_depth(frame_idx, snap_ratio=snap_ratio)
+                    need_rebuild = self._snap_points_to_depth_hard(frame_idx, remove_outliers=True)
+                    if need_rebuild:
+                        optimizer = optim.Adam([
+                            {'params': [self.means], 'lr': 0.00016},
+                            {'params': [self.quats], 'lr': 0.001},
+                            {'params': [self.rgbs], 'lr': 0.0025},
+                            {'params': [self.radii], 'lr': 0.001},  # 极低学习率，保持像素级大小
+                            {'params': [self.opacities], 'lr': 0.05}
+                        ], lr=0.001)
 
+        # ==============================
+        # [最终清理] 训练结束前彻底清除所有漂浮点
+        # ==============================
+        with torch.no_grad():
+            self._snap_points_to_depth_hard(frame_idx, remove_outliers=True)
+            print(f"[Final] Frame {frame_idx} complete. {self.means.shape[0]} Gaussians remaining.")
+        
         rgb_np = (render_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
         
         depth_np = None
