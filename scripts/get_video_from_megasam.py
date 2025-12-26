@@ -5,7 +5,8 @@ import os
 def create_video_for_sam2():
     # 1. 配置路径
     # 请确认这是你的 npz 文件路径
-    npz_path = "/root/autodl-tmp/learn-genmojo/data/car-turn/MegaSAM_Outputs/car-turn_sgd_cvd_hr.npz"
+    # npz_path = "/root/autodl-tmp/learn-genmojo/data/car-turn/MegaSAM_Outputs/car-turn_sgd_cvd_hr.npz"
+    npz_path = "/root/autodl-tmp/mega-sam/outputs_cvd/breakdance-flare_sgd_cvd_hr.npz"
     output_video_path = "images_for_sam2.mp4"
     fps = 24 # 帧率，SAM2 对帧率不敏感，24或30都可以
     
