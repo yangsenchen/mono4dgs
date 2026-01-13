@@ -5,12 +5,11 @@ Gaussian Splatting Scene Reconstruction
 从单目视频重建动态场景的高斯点云表示
 
 Usage:
-    python main.py --data_path <path_to_npz> --video_path <path_to_sam2_video> --exp_name <name>
+    python main.py --dataset_path <path_to_dataset> --exp_name <name>
 
 Example:
     python main.py \
-        --data_path /path/to/data.npz \
-        --video_path /path/to/mask.mp4 \
+        --dataset_path /root/autodl-tmp/shape-of-motion/datasets/breakdance-flare \
         --exp_name my_experiment \
         --use_sds
 """
@@ -29,16 +28,10 @@ def main():
     
     # 必需参数
     parser.add_argument(
-        "--data_path", 
+        "--dataset_path", 
         type=str, 
-        default="/root/autodl-tmp/mega-sam/outputs_cvd/breakdance-flare_sgd_cvd_hr.npz",
-        help="Path to the input .npz data file (contains images, depths, camera poses)"
-    )
-    parser.add_argument(
-        "--video_path", 
-        type=str, 
-        default="/root/autodl-tmp/exp/input/breakdance-flare-sam2.mp4",
-        help="Path to SAM2 segmentation mask video"
+        default="/root/autodl-tmp/shape-of-motion/datasets/breakdance-flare",
+        help="Path to the dataset directory (contains images/, aligned_depth_anything/, masks/ subdirectories and droid_recon.npy)"
     )
     
     # 实验配置
@@ -69,6 +62,13 @@ def main():
         action="store_true",
         help="Enable Zero123 SDS guidance for novel view supervision"
     )
+    
+    # Mask参数
+    parser.add_argument(
+        "--use_mask",
+        action="store_true",
+        help="Enable mask-based training (default: False, train on whole image)"
+    )
 
     args = parser.parse_args()
 
@@ -79,11 +79,11 @@ def main():
 
     # 创建求解器并运行
     solver = GaussianSplattingSolver(
-        data_path=args.data_path, 
-        sam2_video_path=args.video_path, 
+        dataset_path=args.dataset_path, 
         output_dir=full_output_dir,
         focal_ratio=args.focal_ratio,
-        use_sds=args.use_sds 
+        use_sds=args.use_sds,
+        use_mask=args.use_mask
     )
     solver.run()
 
